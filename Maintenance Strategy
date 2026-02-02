@@ -1,0 +1,112 @@
+版本1
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 假设数据：时间点和健康指数（HI）
+time_points = np.arange(0, 100, 1)  # 时间点
+HI_values = np.random.rand(100)  # 假设的健康指数
+tau_m = 0.85  # 上限阈值
+tau_f = 0.75  # 下限阈值
+
+# 贝叶斯推理函数：计算健康指数低于阈值的概率
+def bayesian_update(HI, tau_m, tau_f):
+    P_HI_less_than_tau_m = 1 / (1 + np.exp(-(HI - tau_m)))  # Sigmoid概率模型
+    P_HI_less_than_tau_f = 1 / (1 + np.exp(-(HI - tau_f)))  # Sigmoid概率模型
+    return P_HI_less_than_tau_m, P_HI_less_than_tau_f
+
+# 计算贝叶斯概率
+P_HI_tau_m, P_HI_tau_f = bayesian_update(HI_values, tau_m, tau_f)
+
+# 绘制贝叶斯推理图
+plt.figure(figsize=(10,6))
+plt.plot(time_points, P_HI_tau_m, label=f"P(HI < {tau_m})", color='b')
+plt.plot(time_points, P_HI_tau_f, label=f"P(HI < {tau_f})", color='r')
+plt.xlabel('Time')
+plt.ylabel('Probability')
+plt.title('Bayesian Inference of Health Status')
+plt.legend()
+plt.grid(True)
+plt.show()
+# 假设数据：健康指数（HI）随时间变化
+change_threshold = 0.05  # 设定阈值
+cusum = np.zeros_like(HI_values)  # 初始化CUSUM
+G = np.zeros_like(HI_values)  # CUSUM值
+
+# 计算CUSUM值
+for t in range(1, len(HI_values)):
+    change = HI_values[t] - HI_values[t-1]
+    G[t] = max(0, G[t-1] + change - change_threshold)  # 累积和
+
+# 绘制CUSUM图
+plt.figure(figsize=(10,6))
+plt.plot(time_points, G, label="CUSUM")
+plt.axhline(y=change_threshold, color='r', linestyle='--', label="Threshold")
+plt.xlabel('Time')
+plt.ylabel('CUSUM Value')
+plt.title('CUSUM Trend Detection')
+plt.legend()
+plt.grid(True)
+plt.show()
+# 假设的风险和成本函数
+def calculate_risk(HI, maintenance_cost_factor=1.0):
+    risk = (1 - HI) * maintenance_cost_factor  # 健康指数越低，风险越高
+    return risk
+
+def calculate_cost(HI, cost_factor=1.0):
+    cost = HI * cost_factor  # 健康指数越高，成本越低
+    return cost
+
+# 计算风险和成本
+risks = calculate_risk(HI_values)
+costs = calculate_cost(HI_values)
+
+# 绘制风险与成本图
+plt.figure(figsize=(10,6))
+plt.plot(time_points, risks, label="Risk", color='orange')
+plt.plot(time_points, costs, label="Cost", color='green')
+plt.xlabel('Time')
+plt.ylabel('Value')
+plt.title('Risk and Cost Analysis')
+plt.legend()
+plt.grid(True)
+plt.show()
+# 维护决策：当健康指数低于某个阈值时，决定进行维修
+maintenance_threshold = 0.6  # 假设健康指数低于此值时需要维修
+
+# 计算哪些时间点需要维修
+maintenance_needed = HI_values < maintenance_threshold
+
+# 绘制优化效果图
+plt.figure(figsize=(10,6))
+plt.plot(time_points, HI_values, label="Health Index (HI)", color='blue')
+plt.scatter(time_points[maintenance_needed], HI_values[maintenance_needed], color='red', label="Maintenance Needed", zorder=5)
+plt.axhline(y=maintenance_threshold, color='r', linestyle='--', label="Maintenance Threshold")
+plt.xlabel('Time')
+plt.ylabel('Health Index (HI)')
+plt.title('Optimization: When to Perform Maintenance')
+plt.legend()
+plt.grid(True)
+plt.show()
+# 优化维护策略：计算不同维护策略下的成本和风险
+def maintenance_strategy(cost_factor, risk_factor, HI_values):
+    cost = calculate_cost(HI_values, cost_factor)
+    risk = calculate_risk(HI_values, risk_factor)
+    return cost, risk
+
+# 不同的成本和风险因子
+cost_factor = 0.5
+risk_factor = 0.8
+
+# 计算不同策略下的成本和风险
+costs, risks = maintenance_strategy(cost_factor, risk_factor, HI_values)
+
+# 绘制成本与风险的关系图
+plt.figure(figsize=(10,6))
+plt.plot(time_points, costs, label="Maintenance Cost", color='blue')
+plt.plot(time_points, risks, label="Maintenance Risk", color='red')
+plt.xlabel('Time')
+plt.ylabel('Value')
+plt.title('Cost vs Risk for Maintenance Strategies')
+plt.legend()
+plt.grid(True)
+plt.show()
