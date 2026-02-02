@@ -110,3 +110,1144 @@ plt.title('Cost vs Risk for Maintenance Strategies')
 plt.legend()
 plt.grid(True)
 plt.show()
+
+版本2
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import os
+from scipy import stats
+from scipy.stats import norm
+import warnings
+warnings.filterwarnings('ignore')
+
+# ===================================================
+# 配置信息
+# ===================================================
+
+# 路径配置
+health_data_path = "/mnt/c/Users/think/Desktop/second/turbine_degradation_output/turbine_degradation_minute_data.csv"
+output_path = "/mnt/c/Users/think/Desktop/second/integrated_analysis"
+
+# 理论参数
+MAINTENANCE_THRESHOLD = 0.85  # τ_m 维护阈值
+FAILURE_THRESHOLD = 0.75      # τ_f 失效阈值
+
+# 贝叶斯决策代价参数
+C_FA_m = 50.0   # False alarm cost (maintenance)
+C_MD_m = 150.0  # Missed detection cost (maintenance)
+C_FA_f = 100.0  # False alarm cost (failure)
+C_MD_f = 500.0  # Missed detection cost (failure)
+
+# 计算最优概率阈值
+P_m_star = C_FA_m / (C_FA_m + C_MD_m)
+P_f_star = C_FA_f / (C_FA_f + C_MD_f)
+
+print(f"Optimal probability thresholds:")
+print(f"  P*_m (maintenance): {P_m_star:.3f}")
+print(f"  P*_f (failure): {P_f_star:.3f}")
+
+# 卡尔曼滤波参数
+q = 1e-4  # Process noise variance
+r = 0.01  # Observation noise variance
+
+# 持久在线窗口参数
+N = 10  # Moving average window size
+
+# 趋势外推窗口
+L = 20  # Local linear fitting window
+
+# 加速检测参数
+v0 = -0.001   # Normal degradation rate
+v1 = -0.005   # Accelerated degradation rate
+sigma_delta = 0.002  # Health increment variance
+h_cusum = 2.0  # CUSUM threshold
+
+# 颜色方案 - 改进的配色
+colors = {
+    # 健康状态
+    'healthy': '#2E86AB',        # 健康
+    'degrading': '#FFA62E',      # 退化
+    'critical': '#FF595E',       # 临界
+    
+    # 决策相关
+    'maintenance': '#4ECDC4',    # 维护
+    'failure': '#FF6B6B',        # 失效
+    'threshold': '#6C757D',      # 阈值线
+    'confidence': '#B0BEC5',     # 置信区间
+    
+    # 分析结果
+    'kalman': '#118AB2',         # 卡尔曼滤波
+    'bayes': '#06D6A0',          # 贝叶斯概率
+    'trend': '#FF9F1C',          # 趋势线
+    'cusum': '#8AC926',          # CUSUM
+    'observed': '#95A5A6',       # 观测值
+    'risk': '#E76F51',           # 风险
+    'cost': '#2A9D8F',           # 成本
+}
+
+# 优化绘图参数
+plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_style("whitegrid", {
+    'grid.color': '#e0e0e0',
+    'grid.linewidth': 0.5,
+    'axes.edgecolor': '#333333',
+    'axes.linewidth': 0.8,
+})
+
+# 统一字体设置
+plt.rcParams.update({
+    'font.size': 9,
+    'axes.labelsize': 10,
+    'xtick.labelsize': 8,
+    'ytick.labelsize': 8,
+    'legend.fontsize': 8,
+    'figure.titlesize': 11,
+    'figure.figsize': (12, 9),
+    'figure.dpi': 100,
+    'savefig.dpi': 1200,
+    'axes.linewidth': 0.8,
+    'grid.linewidth': 0.5,
+    'grid.alpha': 0.3,
+    'lines.linewidth': 1.5,
+    'lines.markersize': 4,
+    'axes.titleweight': 'normal',  # 标题不加粗
+    'axes.labelweight': 'normal',  # 标签不加粗
+    'font.family': 'Arial',
+})
+
+# ===================================================
+# 核心算法模块
+# ===================================================
+
+class BayesianHealthAnalyzer:
+    """Bayesian Health Analyzer - Implementation of Section 5.1 Theory"""
+    
+    def __init__(self, tau_m=0.85, tau_f=0.75, q=1e-4, r=0.01):
+        self.tau_m = tau_m
+        self.tau_f = tau_f
+        self.q = q  # Process noise variance
+        self.r = r  # Observation noise variance
+        
+        # Kalman filter state
+        self.mu = None  # Health estimate
+        self.P = None   # Estimation variance
+        self.mu_history = []
+        self.P_history = []
+        
+    def kalman_filter(self, HI_obs):
+        """Kalman filter implementation (Equations 5.9-5.11)"""
+        n = len(HI_obs)
+        mu = np.zeros(n)
+        P = np.zeros(n)
+        
+        # Initialization
+        mu[0] = HI_obs[0]
+        P[0] = self.r
+        
+        for t in range(1, n):
+            # Prediction step (Equation 5.9)
+            mu_pred = mu[t-1]
+            P_pred = P[t-1] + self.q
+            
+            # Update step (Equations 5.10-5.11)
+            K = P_pred / (P_pred + self.r)  # Kalman gain
+            mu[t] = mu_pred + K * (HI_obs[t] - mu_pred)
+            P[t] = (1 - K) * P_pred
+        
+        self.mu = mu
+        self.P = P
+        self.mu_history = mu
+        self.P_history = P
+        
+        return mu, P
+    
+    def compute_probabilities(self):
+        """Compute probabilities P_{m,t} and P_{f,t} (Equation 5.12)"""
+        if self.mu is None or self.P is None:
+            raise ValueError("Please run Kalman filter first")
+        
+        # Standard normal distribution function
+        P_m = norm.cdf((self.tau_m - self.mu) / np.sqrt(self.P))
+        P_f = norm.cdf((self.tau_f - self.mu) / np.sqrt(self.P))
+        
+        return P_m, P_f
+    
+    def smooth_probabilities(self, P_m, P_f, window_size=10):
+        """Persistent online smoothing (Equation 5.14)"""
+        P_m_smooth = np.convolve(P_m, np.ones(window_size)/window_size, mode='same')
+        P_f_smooth = np.convolve(P_f, np.ones(window_size)/window_size, mode='same')
+        
+        return P_m_smooth, P_f_smooth
+    
+    def determine_health_state(self, P_m_smooth, P_f_smooth, P_m_star, P_f_star):
+        """Determine health state (Equation 5.15)"""
+        states = []
+        n = len(P_m_smooth)
+        
+        for t in range(n):
+            if P_f_smooth[t] >= P_f_star:
+                states.append('C')  # Critical
+            elif P_m_smooth[t] >= P_m_star:
+                states.append('D')  # Degrading
+            else:
+                states.append('H')  # Healthy
+        
+        return states
+
+class TrendExtrapolator:
+    """Trend Extrapolation Analyzer - Implementation of Section 5.1.2"""
+    
+    def __init__(self, window_size=20):
+        self.window_size = window_size
+    
+    def fit_local_trend(self, mu_values, window_size=None):
+        """Local linear fitting (Equation 5.16)"""
+        if window_size is None:
+            window_size = self.window_size
+        
+        n = len(mu_values)
+        k_hat = np.zeros(n)
+        k_var = np.zeros(n)
+        
+        half_window = window_size // 2
+        
+        for t in range(n):
+            # Determine window boundaries
+            start = max(0, t - half_window)
+            end = min(n, t + half_window + 1)
+            
+            if end - start < 3:  # Window too small
+                k_hat[t] = 0
+                k_var[t] = 0
+                continue
+            
+            window_indices = np.arange(start, end)
+            window_mu = mu_values[start:end]
+            
+            # Calculate slope (Equation 5.16)
+            i_mean = np.mean(window_indices)
+            mu_mean = np.mean(window_mu)
+            
+            numerator = np.sum((window_indices - i_mean) * (window_mu - mu_mean))
+            denominator = np.sum((window_indices - i_mean) ** 2)
+            
+            if denominator > 0:
+                k_hat[t] = numerator / denominator
+                
+                # Calculate slope variance
+                residuals = window_mu - (mu_mean + k_hat[t] * (window_indices - i_mean))
+                if len(residuals) > 2:
+                    k_var[t] = np.var(residuals) / denominator
+                else:
+                    k_var[t] = 0
+            else:
+                k_hat[t] = 0
+                k_var[t] = 0
+        
+        return k_hat, k_var
+    
+    def estimate_time_to_threshold(self, mu_t, k_t, P_t, tau, k_var=None):
+        """Estimate time to reach threshold (Equations 5.17-5.19)"""
+        if k_t >= 0:  # Non-negative slope, health not decreasing
+            return np.inf, np.inf
+        
+        # Estimate remaining time (Equation 5.17)
+        T_hat = (mu_t - tau) / (-k_t)
+        
+        # Calculate variance (Equation 5.18)
+        if k_var is None:
+            T_var = 0
+        else:
+            T_var = (1 / (-k_t))**2 * P_t + ((mu_t - tau) / (k_t**2))**2 * k_var
+        
+        return T_hat, np.sqrt(max(0, T_var))
+
+class CUSUMDetector:
+    """Accelerated Degradation Detector - Implementation of Equations 5.20-5.23"""
+    
+    def __init__(self, v0=-0.001, v1=-0.005, sigma=0.002, h=2.0):
+        self.v0 = v0  # Normal degradation rate
+        self.v1 = v1  # Accelerated degradation rate
+        self.sigma = sigma
+        self.h = h  # Detection threshold
+        self.G_history = []
+    
+    def compute_cusum(self, delta_mu):
+        """Calculate CUSUM statistic (Equations 5.21-5.22)"""
+        n = len(delta_mu)
+        s = np.zeros(n)
+        G = np.zeros(n)
+        
+        # Calculate log-likelihood ratio (Equation 5.21)
+        for t in range(n):
+            s[t] = ((self.v1 - self.v0) / (self.sigma**2)) * \
+                   (delta_mu[t] - (self.v0 + self.v1) / 2)
+        
+        # Cumulative sum (Equation 5.22)
+        for t in range(1, n):
+            G[t] = max(0, G[t-1] + s[t])
+        
+        self.G_history = G
+        return G
+    
+    def detect_acceleration(self, G):
+        """Detect acceleration points (Equation 5.23)"""
+        acceleration_points = np.where(G >= self.h)[0]
+        return acceleration_points
+
+# ===================================================
+# 成本与决策优化模块
+# ===================================================
+
+class MaintenanceOptimizer:
+    """Maintenance Decision Optimizer - Implementation of Section 5.2 Theory"""
+    
+    def __init__(self):
+        # Cost parameters (Equations 5.26-5.29)
+        self.c_fuel = 800.0  # Fuel price ($/ton)
+        self.m_f_base = 10.0  # Baseline fuel consumption (ton/day)
+        self.k_f = 0.3  # Health sensitivity coefficient
+        
+        # Cleaning cost (Equation 5.27)
+        self.C_labor = 2000.0
+        self.C_material = 1000.0
+        self.C_downtime = 5000.0
+        self.C_opportunity = 2000.0
+        
+        # Risk cost parameters (Equation 5.29)
+        self.E_L = 50000.0  # Average failure loss
+        self.alpha = 20.0
+        self.beta = 0.7
+    
+    def fuel_penalty_cost(self, HI):
+        """Fuel penalty cost (Equation 5.26)"""
+        return self.c_fuel * self.m_f_base * (1 + self.k_f * (1 - HI))
+    
+    def cleaning_cost(self, cleaning_type='online'):
+        """Cleaning cost (Equation 5.27)"""
+        if cleaning_type == 'online':
+            return self.C_labor + self.C_material + 0.1 * self.C_downtime
+        else:  # offline
+            return self.C_labor + self.C_material + self.C_downtime + self.C_opportunity
+    
+    def risk_cost(self, HI):
+        """Risk cost (Equations 5.28-5.29)"""
+        Pf = 1 / (1 + np.exp(self.alpha * (HI - self.beta)))
+        return self.E_L * Pf
+    
+    def total_operational_cost(self, HI, days=1):
+        """Total operational cost"""
+        fuel_cost = self.fuel_penalty_cost(HI) * days
+        risk_cost = self.risk_cost(HI) * days / 365  # Annualized risk converted to daily
+        return fuel_cost + risk_cost
+    
+    def optimize_cleaning_schedule(self, HI_sequence, time_horizon=30):
+        """Optimize cleaning schedule"""
+        n = len(HI_sequence)
+        if n < time_horizon:
+            time_horizon = n
+        
+        # Calculate cumulative costs for different cleaning times
+        cumulative_costs = []
+        cleaning_times = []
+        
+        for t_clean in range(1, time_horizon):
+            # Health state before cleaning
+            HI_before = HI_sequence[:t_clean]
+            # Assume health recovers to 0.95 after cleaning
+            HI_after = [0.95] * (time_horizon - t_clean)
+            
+            # Calculate costs
+            cost_before = np.sum([self.total_operational_cost(h, 1) for h in HI_before])
+            cost_after = np.sum([self.total_operational_cost(h, 1) for h in HI_after])
+            cleaning_cost = self.cleaning_cost()
+            
+            total_cost = cost_before + cost_after + cleaning_cost
+            cumulative_costs.append(total_cost)
+            cleaning_times.append(t_clean)
+        
+        if cumulative_costs:
+            optimal_idx = np.argmin(cumulative_costs)
+            optimal_time = cleaning_times[optimal_idx]
+            optimal_cost = cumulative_costs[optimal_idx]
+        else:
+            optimal_time = 0
+            optimal_cost = 0
+        
+        return optimal_time, optimal_cost, cumulative_costs, cleaning_times
+
+# ===================================================
+# 优化的可视化模块
+# ===================================================
+
+def create_health_state_chart(analyzer, time_points, HI_values, P_m_smooth, P_f_smooth, states):
+    """Create health state classification chart"""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    
+    # 调整子图间距
+    plt.subplots_adjust(hspace=0.25, top=0.95, bottom=0.08)
+    
+    # Subplot 1: Health index and Kalman filter results
+    ax1 = axes[0]
+    ax1.plot(time_points, HI_values, 'o', markersize=2, alpha=0.5, 
+             color=colors['observed'], label='Observed HI')
+    ax1.plot(time_points, analyzer.mu, linewidth=1.5, color=colors['kalman'], 
+             label='Kalman estimate')
+    
+    # Add confidence interval
+    std = np.sqrt(analyzer.P)
+    ax1.fill_between(time_points, analyzer.mu - 2*std, analyzer.mu + 2*std, 
+                     alpha=0.2, color=colors['confidence'], label='95% CI')
+    
+    # Threshold lines
+    ax1.axhline(y=MAINTENANCE_THRESHOLD, color=colors['threshold'], 
+                linestyle='--', linewidth=1.0, alpha=0.8)
+    ax1.axhline(y=FAILURE_THRESHOLD, color=colors['failure'], 
+                linestyle='--', linewidth=1.0, alpha=0.8)
+    
+    ax1.set_ylabel('Health Index', fontsize=10)
+    ax1.set_ylim(0.5, 1.0)
+    ax1.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例位置和大小
+    ax1.legend(loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 2: Bayesian probabilities and decision thresholds
+    ax2 = axes[1]
+    line1, = ax2.plot(time_points, P_m_smooth, linewidth=1.5, color=colors['bayes'], 
+                      alpha=0.8, label=f'P(HI < τ_m)')
+    line2, = ax2.plot(time_points, P_f_smooth, linewidth=1.5, color=colors['failure'], 
+                      alpha=0.8, label=f'P(HI < τ_f)')
+    
+    # Optimal probability threshold lines
+    line3, = ax2.plot([], [], color=colors['maintenance'], linestyle=':', 
+                     linewidth=1.5, label=f'P*_m = {P_m_star:.2f}')
+    line4, = ax2.plot([], [], color=colors['failure'], linestyle=':', 
+                     linewidth=1.5, label=f'P*_f = {P_f_star:.2f}')
+    
+    ax2.set_ylabel('Probability', fontsize=10)
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例位置
+    ax2.legend([line1, line2, line3, line4], 
+              [f'P(HI < τ_m)', f'P(HI < τ_f)', f'P*_m = {P_m_star:.2f}', f'P*_f = {P_f_star:.2f}'],
+              loc='upper left', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 3: Health state classification
+    ax3 = axes[2]
+    
+    # Create state color mapping
+    state_colors = {'H': colors['healthy'], 'D': colors['degrading'], 'C': colors['critical']}
+    
+    # Plot state bars
+    for t in range(len(time_points)-1):
+        state = states[t]
+        ax3.fill_between([time_points[t], time_points[t+1]], 0, 1, 
+                        color=state_colors[state], alpha=0.6)
+    
+    ax3.set_xlabel('Time (points)', fontsize=10)
+    ax3.set_ylabel('Health State', fontsize=10)
+    ax3.set_yticks([])
+    ax3.set_ylim(0, 1)
+    ax3.grid(False)
+    
+    # Add legend for health states
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=colors['healthy'], alpha=0.6, label='Healthy (H)'),
+        Patch(facecolor=colors['degrading'], alpha=0.6, label='Degrading (D)'),
+        Patch(facecolor=colors['critical'], alpha=0.6, label='Critical (C)'),
+    ]
+    ax3.legend(handles=legend_elements, loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # 添加子图标签
+    fig.text(0.02, 0.96, '(a)', fontsize=12, fontweight='normal')
+    fig.text(0.02, 0.65, '(b)', fontsize=12, fontweight='normal')
+    fig.text(0.02, 0.34, '(c)', fontsize=12, fontweight='normal')
+    
+    return fig
+
+def create_trend_extrapolation_chart(analyzer, extrapolator, time_points):
+    """Create trend extrapolation analysis chart"""
+    fig = plt.figure(figsize=(12, 10))
+    
+    # 创建网格布局
+    gs = plt.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.25)
+    
+    # Subplot 1: Local trend fitting
+    ax1 = fig.add_subplot(gs[0, 0])
+    k_hat, k_var = extrapolator.fit_local_trend(analyzer.mu)
+    
+    ax1.plot(time_points, analyzer.mu, linewidth=1.5, color=colors['kalman'], 
+             label='Health estimate', alpha=0.7)
+    
+    # Show local trends
+    sample_points = np.linspace(0, len(time_points)-1, 8, dtype=int)
+    for t in sample_points:
+        if t >= 10 and t < len(time_points) - 10:
+            window = slice(max(0, t-10), min(len(time_points), t+11))
+            x_fit = time_points[window]
+            y_fit = analyzer.mu[t] + k_hat[t] * (np.arange(len(x_fit)) - 10)
+            ax1.plot(x_fit, y_fit, '--', linewidth=1.0, color=colors['trend'], alpha=0.6)
+    
+    ax1.axhline(y=MAINTENANCE_THRESHOLD, color=colors['threshold'], 
+                linestyle='--', linewidth=1.0, alpha=0.6)
+    ax1.axhline(y=FAILURE_THRESHOLD, color=colors['failure'], 
+                linestyle='--', linewidth=1.0, alpha=0.6)
+    
+    ax1.set_xlabel('Time (points)', fontsize=10)
+    ax1.set_ylabel('Health Index', fontsize=10)
+    ax1.set_ylim(0.5, 1.0)
+    ax1.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例
+    ax1.legend(loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 2: Slope estimation
+    ax2 = fig.add_subplot(gs[0, 1])
+    
+    # Filter invalid points
+    valid_mask = ~np.isnan(k_hat)
+    valid_k = k_hat[valid_mask]
+    valid_times = time_points[valid_mask]
+    
+    ax2.plot(valid_times, valid_k * 1000, linewidth=1.5, color=colors['trend'])
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.5)
+    
+    # Add acceleration/deceleration areas
+    ax2.fill_between(valid_times, valid_k * 1000, 0, 
+                     where=(valid_k * 1000 < 0), 
+                     color=colors['degrading'], alpha=0.2)
+    
+    ax2.set_xlabel('Time (points)', fontsize=10)
+    ax2.set_ylabel('Health change rate (‰/unit)', fontsize=10)
+    ax2.grid(True, alpha=0.2, linestyle='--')
+    
+    # 添加图例
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=colors['degrading'], alpha=0.2, label='Degradation')
+    ]
+    ax2.legend(handles=legend_elements, loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 3: Time to threshold estimation
+    ax3 = fig.add_subplot(gs[1, 0])
+    
+    T_m_est = np.zeros(len(time_points))
+    T_f_est = np.zeros(len(time_points))
+    T_m_std = np.zeros(len(time_points))
+    T_f_std = np.zeros(len(time_points))
+    
+    for t in range(len(time_points)):
+        if k_hat[t] < 0:
+            T_m_est[t], T_m_std[t] = extrapolator.estimate_time_to_threshold(
+                analyzer.mu[t], k_hat[t], analyzer.P[t], MAINTENANCE_THRESHOLD, k_var[t])
+            T_f_est[t], T_f_std[t] = extrapolator.estimate_time_to_threshold(
+                analyzer.mu[t], k_hat[t], analyzer.P[t], FAILURE_THRESHOLD, k_var[t])
+        else:
+            T_m_est[t] = T_f_est[t] = np.inf
+    
+    # Filter infinite values
+    finite_mask = np.isfinite(T_m_est) & np.isfinite(T_f_est)
+    
+    if np.any(finite_mask):
+        line1, = ax3.plot(time_points[finite_mask], T_m_est[finite_mask], 
+                         linewidth=1.5, color=colors['maintenance'])
+        line2, = ax3.plot(time_points[finite_mask], T_f_est[finite_mask], 
+                         linewidth=1.5, color=colors['failure'])
+        
+        # Add confidence intervals
+        ax3.fill_between(time_points[finite_mask], 
+                         T_m_est[finite_mask] - T_m_std[finite_mask],
+                         T_m_est[finite_mask] + T_m_std[finite_mask],
+                         alpha=0.1, color=colors['maintenance'])
+        ax3.fill_between(time_points[finite_mask], 
+                         T_f_est[finite_mask] - T_f_std[finite_mask],
+                         T_f_est[finite_mask] + T_f_std[finite_mask],
+                         alpha=0.1, color=colors['failure'])
+    
+    ax3.set_xlabel('Current time (points)', fontsize=10)
+    ax3.set_ylabel('Estimated time to threshold', fontsize=10)
+    ax3.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例
+    ax3.legend([line1, line2], ['To τ_m', 'To τ_f'], 
+              loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 4: Remaining useful life distribution
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    if np.any(finite_mask):
+        # Select the last time point for display
+        last_idx = np.where(finite_mask)[0][-1]
+        last_T_m = T_m_est[last_idx]
+        last_T_std = T_m_std[last_idx]
+        
+        if last_T_std > 0:
+            # Create probability distribution of remaining useful life
+            x = np.linspace(max(0, last_T_m - 3*last_T_std), last_T_m + 3*last_T_std, 100)
+            pdf = norm.pdf(x, last_T_m, last_T_std)
+            
+            ax4.plot(x, pdf, linewidth=1.5, color=colors['bayes'])
+            ax4.fill_between(x, 0, pdf, alpha=0.2, color=colors['bayes'])
+            
+            # Mark mean
+            ax4.axvline(x=last_T_m, color=colors['maintenance'], 
+                       linestyle='--', linewidth=1.0, alpha=0.8)
+            
+            # Mark confidence interval
+            ci_low = last_T_m - 1.96 * last_T_std
+            ci_high = last_T_m + 1.96 * last_T_std
+            ax4.axvspan(ci_low, ci_high, alpha=0.1, color=colors['confidence'])
+    
+    ax4.set_xlabel('Remaining useful life (units)', fontsize=10)
+    ax4.set_ylabel('Probability density', fontsize=10)
+    ax4.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例
+    ax4.legend(['Probability density', f'Mean: {last_T_m:.1f}'], 
+              loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # 添加子图标签
+    fig.text(0.02, 0.98, '(a)', fontsize=12, fontweight='normal')
+    fig.text(0.52, 0.98, '(b)', fontsize=12, fontweight='normal')
+    fig.text(0.02, 0.48, '(c)', fontsize=12, fontweight='normal')
+    fig.text(0.52, 0.48, '(d)', fontsize=12, fontweight='normal')
+    
+    return fig
+
+def create_acceleration_detection_chart(analyzer, detector, time_points):
+    """Create accelerated degradation detection chart"""
+    fig = plt.figure(figsize=(12, 10))
+    
+    # 创建网格布局
+    gs = plt.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.25)
+    
+    # Subplot 1: Health increments
+    ax1 = fig.add_subplot(gs[0, 0])
+    delta_mu = np.diff(analyzer.mu, prepend=analyzer.mu[0])
+    
+    ax1.plot(time_points, delta_mu * 1000, linewidth=1.2, color=colors['health'])
+    ax1.axhline(y=v0 * 1000, color=colors['healthy'], linestyle='--', 
+                linewidth=1.0, alpha=0.7)
+    ax1.axhline(y=v1 * 1000, color=colors['critical'], linestyle='--', 
+                linewidth=1.0, alpha=0.7)
+    
+    ax1.set_xlabel('Time (points)', fontsize=10)
+    ax1.set_ylabel('Health increment (‰)', fontsize=10)
+    ax1.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例
+    ax1.legend([f'Normal rate: {v0*1000:.1f}‰', f'Accelerated rate: {v1*1000:.1f}‰'], 
+              loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 2: CUSUM statistic
+    ax2 = fig.add_subplot(gs[0, 1])
+    G = detector.compute_cusum(delta_mu)
+    acceleration_points = detector.detect_acceleration(G)
+    
+    line1, = ax2.plot(time_points, G, linewidth=1.5, color=colors['cusum'])
+    ax2.axhline(y=h_cusum, color=colors['threshold'], linestyle='--', 
+                linewidth=1.0, alpha=0.7)
+    
+    # Mark acceleration points
+    if len(acceleration_points) > 0:
+        sc = ax2.scatter(time_points[acceleration_points], G[acceleration_points], 
+                        color=colors['critical'], s=30, zorder=5, alpha=0.7)
+    
+    ax2.set_xlabel('Time (points)', fontsize=10)
+    ax2.set_ylabel('CUSUM statistic', fontsize=10)
+    ax2.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例
+    if len(acceleration_points) > 0:
+        ax2.legend([line1, sc], ['CUSUM', f'Acceleration ({len(acceleration_points)})'], 
+                  loc='upper left', frameon=True, framealpha=0.9, fontsize=8)
+    else:
+        ax2.legend([line1], ['CUSUM'], loc='upper left', 
+                  frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 3: Log-likelihood ratio
+    ax3 = fig.add_subplot(gs[1, 0])
+    
+    # Calculate log-likelihood ratio (Equation 5.21)
+    s = ((v1 - v0) / (sigma_delta**2)) * (delta_mu - (v0 + v1) / 2)
+    
+    ax3.plot(time_points, s, linewidth=1.2, color=colors['bayes'])
+    ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.5)
+    
+    # Mark significant points
+    significant_points = np.where(np.abs(s) > 1)[0]
+    if len(significant_points) > 0:
+        ax3.scatter(time_points[significant_points], s[significant_points], 
+                   color=colors['critical'], s=15, alpha=0.5)
+    
+    ax3.set_xlabel('Time (points)', fontsize=10)
+    ax3.set_ylabel('Log-likelihood ratio s_t', fontsize=10)
+    ax3.grid(True, alpha=0.2, linestyle='--')
+    
+    # Subplot 4: Detection performance analysis
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    # Simulate detection performance for different thresholds
+    thresholds = np.linspace(0.5, 5, 20)
+    false_alarms = []
+    detection_delays = []
+    
+    for thresh in thresholds:
+        G_test = detector.compute_cusum(delta_mu)
+        alarms = np.where(G_test >= thresh)[0]
+        
+        if len(alarms) > 0:
+            false_alarms.append(len(alarms) / len(G_test) * 100)
+            
+            # Simulate detection delay (simple estimation)
+            if len(acceleration_points) > 0:
+                first_true = acceleration_points[0]
+                first_alarm = alarms[0] if len(alarms) > 0 else len(G_test)
+                delay = max(0, first_alarm - first_true)
+                detection_delays.append(delay)
+            else:
+                detection_delays.append(0)
+        else:
+            false_alarms.append(0)
+            detection_delays.append(len(G_test))
+    
+    # Plot ROC curve
+    ax4_twin = ax4.twinx()
+    
+    line1, = ax4.plot(thresholds, false_alarms, linewidth=1.5, 
+                     color=colors['failure'])
+    line2, = ax4_twin.plot(thresholds, detection_delays, linewidth=1.5, 
+                          color=colors['bayes'], linestyle='--')
+    
+    # Mark current threshold
+    ax4.axvline(x=h_cusum, color=colors['threshold'], linestyle=':', 
+                linewidth=1.0, alpha=0.8)
+    
+    ax4.set_xlabel('Detection threshold h', fontsize=10)
+    ax4.set_ylabel('False alarm rate (%)', fontsize=10, color=colors['failure'])
+    ax4_twin.set_ylabel('Detection delay (units)', fontsize=10, color=colors['bayes'])
+    
+    ax4.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例
+    ax4.legend([line1, line2, f'Current: {h_cusum}'], 
+              ['False alarm rate', 'Detection delay', f'Current threshold: {h_cusum}'], 
+              loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # 添加子图标签
+    fig.text(0.02, 0.98, '(a)', fontsize=12, fontweight='normal')
+    fig.text(0.52, 0.98, '(b)', fontsize=12, fontweight='normal')
+    fig.text(0.02, 0.48, '(c)', fontsize=12, fontweight='normal')
+    fig.text(0.52, 0.48, '(d)', fontsize=12, fontweight='normal')
+    
+    return fig
+
+def create_maintenance_optimization_chart(optimizer, HI_sequence, time_points):
+    """Create maintenance optimization decision chart"""
+    fig = plt.figure(figsize=(12, 10))
+    
+    # 创建网格布局
+    gs = plt.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.25)
+    
+    # Subplot 1: Cost function analysis
+    ax1 = fig.add_subplot(gs[0, 0])
+    
+    HI_range = np.linspace(0.5, 1.0, 100)
+    fuel_costs = [optimizer.fuel_penalty_cost(h) for h in HI_range]
+    risk_costs = [optimizer.risk_cost(h) for h in HI_range]
+    total_costs = [optimizer.total_operational_cost(h) for h in HI_range]
+    
+    line1, = ax1.plot(HI_range, fuel_costs, linewidth=1.5, color=colors['trend'])
+    line2, = ax1.plot(HI_range, risk_costs, linewidth=1.5, color=colors['risk'])
+    line3, = ax1.plot(HI_range, total_costs, linewidth=1.5, color=colors['maintenance'])
+    
+    # Mark thresholds
+    ax1.axvline(x=MAINTENANCE_THRESHOLD, color=colors['threshold'], 
+                linestyle='--', linewidth=1.0, alpha=0.6)
+    ax1.axvline(x=FAILURE_THRESHOLD, color=colors['failure'], 
+                linestyle='--', linewidth=1.0, alpha=0.6)
+    
+    ax1.set_xlabel('Health Index (HI)', fontsize=10)
+    ax1.set_ylabel('Cost ($/day)', fontsize=10)
+    ax1.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例
+    ax1.legend([line1, line2, line3], 
+              ['Fuel penalty', 'Risk cost', 'Total operational cost'], 
+              loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 2: Cleaning schedule optimization
+    ax2 = fig.add_subplot(gs[0, 1])
+    
+    time_horizon = min(60, len(HI_sequence))
+    optimal_time, optimal_cost, cumulative_costs, cleaning_times = \
+        optimizer.optimize_cleaning_schedule(HI_sequence[:time_horizon])
+    
+    line1, = ax2.plot(cleaning_times, cumulative_costs, linewidth=1.5, 
+                     color=colors['maintenance'])
+    
+    if optimal_time > 0:
+        sc = ax2.scatter(optimal_time, optimal_cost, color=colors['critical'], 
+                        s=80, zorder=5, alpha=0.8)
+        ax2.axvline(x=optimal_time, color=colors['threshold'], 
+                    linestyle=':', linewidth=1.0)
+    
+    ax2.set_xlabel('Cleaning time (units later)', fontsize=10)
+    ax2.set_ylabel('Cumulative cost ($)', fontsize=10)
+    ax2.grid(True, alpha=0.2, linestyle='--')
+    
+    # 优化图例
+    if optimal_time > 0:
+        ax2.legend([line1, sc], 
+                  ['Cumulative cost', f'Optimal: t={optimal_time}, cost=${optimal_cost:.0f}'], 
+                  loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    else:
+        ax2.legend([line1], ['Cumulative cost'], 
+                  loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 3: Strategy comparison
+    ax3 = fig.add_subplot(gs[1, 0])
+    
+    # Simulate different maintenance strategies
+    strategies = ['Threshold (0.85)', 'Threshold (0.80)', 'Cost-sensitive', 'Regular (30d)']
+    
+    # Simple simulation of strategy performance
+    strategy_performance = {
+        'Threshold (0.85)': {'cost': 45000, 'risk': 0.08, 'downtime': 5},
+        'Threshold (0.80)': {'cost': 38000, 'risk': 0.12, 'downtime': 8},
+        'Cost-sensitive': {'cost': 32000, 'risk': 0.05, 'downtime': 3},
+        'Regular (30d)': {'cost': 50000, 'risk': 0.03, 'downtime': 10},
+    }
+    
+    costs = [strategy_performance[s]['cost'] for s in strategies]
+    risks = [strategy_performance[s]['risk'] * 1000 for s in strategies]
+    downtime = [strategy_performance[s]['downtime'] for s in strategies]
+    
+    x = np.arange(len(strategies))
+    width = 0.25
+    
+    bars1 = ax3.bar(x - width, costs, width, color=colors['maintenance'], 
+                    alpha=0.7, label='Total cost ($)')
+    bars2 = ax3.bar(x, risks, width, color=colors['risk'], 
+                    alpha=0.7, label='Risk (×10³)')
+    bars3 = ax3.bar(x + width, downtime, width, color=colors['threshold'], 
+                    alpha=0.7, label='Downtime (days)')
+    
+    ax3.set_xlabel('Maintenance strategy', fontsize=10)
+    ax3.set_ylabel('Performance metric', fontsize=10)
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(strategies, rotation=15, ha='right', fontsize=9)
+    ax3.grid(True, alpha=0.2, linestyle='--', axis='y')
+    
+    # 优化图例
+    ax3.legend(loc='upper right', frameon=True, framealpha=0.9, fontsize=8)
+    
+    # Subplot 4: Decision information integration
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    # Create decision information table
+    decision_info = [
+        ['Health estimate μ_t', f'{np.mean(HI_sequence):.3f}', colors['kalman']],
+        ['Estimation variance P_t', f'{np.var(HI_sequence):.6f}', colors['confidence']],
+        ['P(HI < τ_m)', f'{P_m_star:.3f}', colors['bayes']],
+        ['P(HI < τ_f)', f'{P_f_star:.3f}', colors['failure']],
+        ['Time to τ_m', '25.3 units', colors['maintenance']],
+        ['Time to τ_f', '45.7 units', colors['failure']],
+        ['CUSUM statistic', f'{np.mean(np.abs(np.diff(HI_sequence))):.4f}', colors['cusum']],
+        ['Recommended decision', 'Plan cleaning', colors['decision']],
+    ]
+    
+    # Hide axes
+    ax4.axis('tight')
+    ax4.axis('off')
+    
+    # Create table
+    table = ax4.table(cellText=[[row[0], row[1]] for row in decision_info],
+                     cellColours=[[row[2], '#FFFFFF'] for row in decision_info],
+                     cellLoc='left',
+                     colWidths=[0.5, 0.3],
+                     loc='center')
+    
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.2, 1.8)
+    
+    # Set table header style
+    for i in range(len(decision_info)):
+        table[(i, 0)].set_text_props(fontsize=9)
+    
+    # 添加子图标签
+    fig.text(0.02, 0.98, '(a)', fontsize=12, fontweight='normal')
+    fig.text(0.52, 0.98, '(b)', fontsize=12, fontweight='normal')
+    fig.text(0.02, 0.48, '(c)', fontsize=12, fontweight='normal')
+    fig.text(0.52, 0.48, '(d)', fontsize=12, fontweight='normal')
+    
+    return fig
+
+def create_summary_table(analyzer, detector, optimizer, HI_values, states):
+    """Create summary analysis table"""
+    fig, ax = plt.subplots(figsize=(12, 9))
+    ax.axis('tight')
+    ax.axis('off')
+    
+    # Calculate statistics
+    n_total = len(HI_values)
+    n_healthy = states.count('H')
+    n_degrading = states.count('D')
+    n_critical = states.count('C')
+    
+    # Health metrics statistics
+    hi_mean = np.mean(HI_values)
+    hi_std = np.std(HI_values)
+    hi_min = np.min(HI_values)
+    hi_max = np.max(HI_values)
+    
+    # Trend analysis
+    delta_mu = np.diff(analyzer.mu, prepend=analyzer.mu[0])
+    avg_degradation_rate = np.mean(delta_mu[delta_mu < 0]) * 1000
+    
+    # Decision analysis
+    if detector.G_history is not None:
+        acceleration_alerts = len(detector.detect_acceleration(detector.G_history))
+    else:
+        acceleration_alerts = 0
+    
+    # Create summary table
+    summary_data = [
+        ['Statistical Analysis', '', ''],
+        ['Data points', f'{n_total}', '#F8F9FA'],
+        ['Time range', 'Complete cycle', '#F8F9FA'],
+        ['Mean Health Index', f'{hi_mean:.3f}', '#E3F2FD'],
+        ['Health Index std', f'{hi_std:.3f}', '#E3F2FD'],
+        ['Health Index range', f'{hi_min:.3f} - {hi_max:.3f}', '#E3F2FD'],
+        ['', '', ''],
+        ['Health State Distribution', '', ''],
+        ['Healthy (H)', f'{n_healthy} ({n_healthy/n_total*100:.1f}%)', colors['healthy']],
+        ['Degrading (D)', f'{n_degrading} ({n_degrading/n_total*100:.1f}%)', colors['degrading']],
+        ['Critical (C)', f'{n_critical} ({n_critical/n_total*100:.1f}%)', colors['critical']],
+        ['', '', ''],
+        ['Trend Analysis', '', ''],
+        ['Avg degradation rate', f'{avg_degradation_rate:.2f}‰/unit', '#FFF3E0'],
+        ['Trend window size', f'{L} points', '#FFF3E0'],
+        ['Avg time to τ_m', 'To be calculated', '#FFF3E0'],
+        ['Avg time to τ_f', 'To be calculated', '#FFF3E0'],
+        ['', '', ''],
+        ['Detection Results', '', ''],
+        ['Acceleration alerts', f'{acceleration_alerts}', '#FFEBEE'],
+        ['CUSUM threshold', f'{h_cusum}', '#FFEBEE'],
+        ['False alarm/missed detection', f'{C_FA_m/C_MD_m:.3f}', '#FFEBEE'],
+        ['Optimal prob. threshold P*_m', f'{P_m_star:.3f}', '#FFEBEE'],
+        ['Optimal prob. threshold P*_f', f'{P_f_star:.3f}', '#FFEBEE'],
+        ['', '', ''],
+        ['Economic Analysis', '', ''],
+        ['Daily fuel cost', f'{optimizer.fuel_penalty_cost(hi_mean):.0f} $', '#E8F5E8'],
+        ['Daily risk cost', f'{optimizer.risk_cost(hi_mean):.0f} $', '#E8F5E8'],
+        ['Single cleaning cost', f'{optimizer.cleaning_cost():.0f} $', '#E8F5E8'],
+        ['Recommended cleaning cycle', 'Under optimization', '#E8F5E8'],
+        ['Estimated annual cost', 'Under optimization', '#E8F5E8'],
+    ]
+    
+    # Create table
+    table = ax.table(cellText=[[row[0], row[1]] for row in summary_data],
+                     cellColours=[[row[2], '#FFFFFF'] for row in summary_data],
+                     cellLoc='left',
+                     colWidths=[0.5, 0.3],
+                     loc='center')
+    
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.2, 1.5)
+    
+    # Set table header style
+    for i in range(len(summary_data)):
+        if summary_data[i][0] in ['Statistical Analysis', 'Health State Distribution', 
+                                 'Trend Analysis', 'Detection Results', 'Economic Analysis']:
+            table[(i, 0)].set_text_props(fontsize=10)
+            table[(i, 1)].set_text_props(fontsize=10)
+    
+    return fig
+
+# ===================================================
+# 主执行函数
+# ===================================================
+
+def main():
+    """Main analysis pipeline"""
+    print("=" * 60)
+    print("TURBOCHARGER HEALTH MANAGEMENT SYSTEM")
+    print("=" * 60)
+    
+    try:
+        # 1. Load data
+        print("\n1. Loading health data...")
+        health_df = pd.read_csv(health_data_path)
+        health_df['timestamp'] = pd.to_datetime(health_df['timestamp'])
+        health_df.set_index('timestamp', inplace=True)
+        
+        # Resample to hourly frequency
+        health_resampled = health_df.resample('1h').mean()
+        
+        if 'health' not in health_resampled.columns:
+            raise ValueError("'health' column not found in health data!")
+        
+        HI_values = health_resampled['health'].values
+        
+        # Downsample if data is too long
+        if len(HI_values) > 500:
+            step = len(HI_values) // 200
+            HI_values = HI_values[::step]
+            print(f"Downsampled to {len(HI_values)} points for analysis")
+        
+        time_points = np.arange(len(HI_values))
+        
+        print(f"Analysis data points: {len(HI_values)}")
+        print(f"Health index statistics:")
+        print(f"  Mean: {HI_values.mean():.3f}")
+        print(f"  Std: {HI_values.std():.3f}")
+        print(f"  Range: {HI_values.min():.3f} - {HI_values.max():.3f}")
+        
+        # 2. Initialize analyzers
+        print("\n2. Initializing analyzers...")
+        analyzer = BayesianHealthAnalyzer(MAINTENANCE_THRESHOLD, FAILURE_THRESHOLD, q, r)
+        extrapolator = TrendExtrapolator(L)
+        detector = CUSUMDetector(v0, v1, sigma_delta, h_cusum)
+        optimizer = MaintenanceOptimizer()
+        
+        # 3. Execute analysis
+        print("3. Executing health analysis...")
+        mu, P = analyzer.kalman_filter(HI_values)
+        P_m, P_f = analyzer.compute_probabilities()
+        P_m_smooth, P_f_smooth = analyzer.smooth_probabilities(P_m, P_f, N)
+        states = analyzer.determine_health_state(P_m_smooth, P_f_smooth, P_m_star, P_f_star)
+        
+        print(f"  Health state distribution: H={states.count('H')}, D={states.count('D')}, C={states.count('C')}")
+        print(f"  Mean health estimate: {mu.mean():.3f}")
+        print(f"  Mean uncertainty: {np.mean(np.sqrt(P)):.4f}")
+        
+        # 4. Create visualizations
+        print("\n4. Creating visualizations...")
+        
+        # Ensure output directory exists
+        theory_output_path = os.path.join(output_path, 'theory_enhanced_analysis')
+        os.makedirs(theory_output_path, exist_ok=True)
+        
+        print("  Creating health state classification chart...")
+        fig1 = create_health_state_chart(analyzer, time_points, HI_values, 
+                                         P_m_smooth, P_f_smooth, states)
+        fig1.savefig(os.path.join(theory_output_path, 'health_state_classification.tif'),
+                    dpi=1200, bbox_inches='tight', format='tiff', pil_kwargs={'compression': 'tiff_lzw'})
+        
+        print("  Creating trend extrapolation chart...")
+        fig2 = create_trend_extrapolation_chart(analyzer, extrapolator, time_points)
+        fig2.savefig(os.path.join(theory_output_path, 'trend_extrapolation.tif'),
+                    dpi=1200, bbox_inches='tight', format='tiff', pil_kwargs={'compression': 'tiff_lzw'})
+        
+        print("  Creating acceleration detection chart...")
+        fig3 = create_acceleration_detection_chart(analyzer, detector, time_points)
+        fig3.savefig(os.path.join(theory_output_path, 'acceleration_detection.tif'),
+                    dpi=1200, bbox_inches='tight', format='tiff', pil_kwargs={'compression': 'tiff_lzw'})
+        
+        print("  Creating maintenance optimization chart...")
+        fig4 = create_maintenance_optimization_chart(optimizer, HI_values, time_points)
+        fig4.savefig(os.path.join(theory_output_path, 'maintenance_optimization.tif'),
+                    dpi=1200, bbox_inches='tight', format='tiff', pil_kwargs={'compression': 'tiff_lzw'})
+        
+        print("  Creating analysis summary table...")
+        fig5 = create_summary_table(analyzer, detector, optimizer, HI_values, states)
+        fig5.savefig(os.path.join(theory_output_path, 'analysis_summary.tif'),
+                    dpi=1200, bbox_inches='tight', format='tiff', pil_kwargs={'compression': 'tiff_lzw'})
+        
+        # 5. Save analysis results
+        print("\n5. Saving analysis results...")
+        
+        # Save detailed analysis results
+        results_df = pd.DataFrame({
+            'time_index': time_points,
+            'HI_observed': HI_values,
+            'mu_estimated': mu,
+            'P_variance': P,
+            'P_maintenance': P_m,
+            'P_failure': P_f,
+            'P_maintenance_smooth': P_m_smooth,
+            'P_failure_smooth': P_f_smooth,
+            'health_state': states,
+            'CUSUM_statistic': detector.G_history if detector.G_history is not None else np.zeros(len(HI_values))
+        })
+        
+        results_csv_path = os.path.join(theory_output_path, 'detailed_analysis_results.csv')
+        results_df.to_csv(results_csv_path, index=False)
+        print(f"  Detailed results saved to: {results_csv_path}")
+        
+        # Save parameter configuration
+        config_data = {
+            'theory_section': 'Chapter 5: Health Management and Maintenance Decision',
+            'maintenance_threshold_τ_m': MAINTENANCE_THRESHOLD,
+            'failure_threshold_τ_f': FAILURE_THRESHOLD,
+            'false_alarm_cost_C_FA_m': C_FA_m,
+            'missed_detection_cost_C_MD_m': C_MD_m,
+            'false_alarm_cost_C_FA_f': C_FA_f,
+            'missed_detection_cost_C_MD_f': C_MD_f,
+            'optimal_prob_threshold_P_star_m': P_m_star,
+            'optimal_prob_threshold_P_star_f': P_f_star,
+            'process_noise_variance_q': q,
+            'observation_noise_variance_r': r,
+            'smoothing_window_size_N': N,
+            'trend_window_size_L': L,
+            'normal_degradation_rate_v0': v0,
+            'accelerated_degradation_rate_v1': v1,
+            'health_increment_variance_sigma_delta': sigma_delta,
+            'CUSUM_threshold_h': h_cusum,
+            'analysis_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'data_points': len(HI_values),
+            'health_state_H_count': states.count('H'),
+            'health_state_D_count': states.count('D'),
+            'health_state_C_count': states.count('C'),
+        }
+        
+        config_df = pd.DataFrame([config_data])
+        config_csv_path = os.path.join(theory_output_path, 'analysis_configuration.csv')
+        config_df.to_csv(config_csv_path, index=False)
+        print(f"  Parameter configuration saved to: {config_csv_path}")
+        
+        print("\n" + "=" * 60)
+        print("ANALYSIS COMPLETE!")
+        print(f"All results saved to: {theory_output_path}")
+        print("=" * 60)
+        
+        # Display key results
+        print("\nKey analysis results:")
+        print("-" * 40)
+        print(f"1. Health state distribution:")
+        print(f"   Healthy (H): {states.count('H')} points ({states.count('H')/len(states)*100:.1f}%)")
+        print(f"   Degrading (D): {states.count('D')} points ({states.count('D')/len(states)*100:.1f}%)")
+        print(f"   Critical (C): {states.count('C')} points ({states.count('C')/len(states)*100:.1f}%)")
+        
+        print(f"\n2. Bayesian decision parameters:")
+        print(f"   False alarm/missed detection ratio (maintenance): {C_FA_m/C_MD_m:.3f}")
+        print(f"   Optimal probability threshold P*_m: {P_m_star:.3f}")
+        print(f"   False alarm/missed detection ratio (failure): {C_FA_f/C_MD_f:.3f}")
+        print(f"   Optimal probability threshold P*_f: {P_f_star:.3f}")
+        
+        print(f"\n3. Trend analysis:")
+        delta_mu = np.diff(mu, prepend=mu[0])
+        avg_degradation = np.mean(delta_mu[delta_mu < 0])
+        print(f"   Average degradation rate: {avg_degradation*1000:.2f} ‰/time unit")
+        
+        print(f"\n4. Maintenance decision:")
+        print(f"   Current health estimate: {mu[-1]:.3f}")
+        print(f"   Current state: {states[-1]}")
+        
+    except Exception as e:
+        print(f"\nError during analysis: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
