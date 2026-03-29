@@ -903,3 +903,1157 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+版本2 ，论文第五章
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm, linregress
+
+warnings.filterwarnings("ignore")
+
+# ===================================================
+# 配置
+# ===================================================
+data_path = r"/mnt/c/Users/think/Desktop/second/turbine_degradation_output/turbine_degradation_minute_data.csv"
+
+output_path = r"/mnt/c/Users/think/Desktop/second/theory_enhanced_analysis_realdata_full"
+os.makedirs(output_path, exist_ok=True)
+
+# 决策阈值
+MAINTENANCE_THRESHOLD = 0.88
+FAILURE_THRESHOLD = 0.75
+
+# 虚拟终点（pseudo EOL）
+USE_DYNAMIC_VIRTUAL_EOL = True
+VIRTUAL_EOL_QUANTILE = 0.01
+VIRTUAL_EOL_FLOOR = 0.68
+
+# 贝叶斯代价参数
+C_FA_m, C_MD_m = 50.0, 200.0
+C_FA_f, C_MD_f = 100.0, 1000.0
+P_m_star = C_FA_m / (C_FA_m + C_MD_m)
+P_f_star = C_FA_f / (C_FA_f + C_MD_f)
+
+# 卡尔曼参数
+q = 2e-4
+r = 1e-3
+
+# 平滑/趋势/绘图参数
+SMOOTH_WINDOW = 180
+RATE_SMOOTH_WINDOW = 120
+PROB_SMOOTH_WINDOW = 360
+TREND_WINDOW_POINTS = 720
+PLOT_MAX_POINTS = 6000
+
+# RUL / 伪寿命
+MIN_ABS_SLOPE = 5e-5
+MAX_RUL_HOURS = 800
+
+# Monte Carlo
+MC_SAMPLES = 500
+MC_HORIZON_HOURS = 800
+MC_DT_HOURS = 1.0
+
+# rolling z-score + 单边CUSUM
+ZSCORE_BASELINE_WINDOW = 10080
+ZSCORE_THRESHOLD = 4.5
+CUSUM_K = 1.5
+CUSUM_H = 40.0
+
+# 报警压缩
+ALARM_MIN_GAP_POINTS = 720
+
+colors = {
+    'healthy': '#2E86AB',
+    'degrading': '#FFA62E',
+    'critical': '#FF595E',
+    'maintenance': '#4ECDC4',
+    'failure': '#FF6B6B',
+    'threshold': '#6C757D',
+    'confidence': '#B0BEC5',
+    'kalman': '#118AB2',
+    'bayes': '#06D6A0',
+    'trend': '#FF9F1C',
+    'cusum': '#8AC926',
+    'observed': '#95A5A6',
+    'risk': '#E76F51',
+    'cost': '#2A9D8F',
+    'cleaning': '#7B2CBF',
+    'terminal': '#7E57C2',
+}
+
+plt.style.use('default')
+plt.rcParams.update({
+    'font.size': 9,
+    'axes.labelsize': 10,
+    'xtick.labelsize': 8,
+    'ytick.labelsize': 8,
+    'legend.fontsize': 8,
+    'figure.figsize': (12, 9),
+    'figure.dpi': 1200,
+    'savefig.dpi': 1200,
+    'axes.linewidth': 0.8,
+    'grid.linewidth': 0.5,
+    'grid.alpha': 0.3,
+    'lines.linewidth': 1.5,
+})
+
+# ===================================================
+# 工具函数
+# ===================================================
+def add_subcaption(ax, text):
+    ax.text(
+        0.5, -0.18, text,
+        transform=ax.transAxes,
+        ha='center', va='top',
+        fontsize=10
+    )
+
+def thin_for_plot(df, max_points=PLOT_MAX_POINTS):
+    if len(df) <= max_points:
+        return df.copy()
+    step = int(np.ceil(len(df) / max_points))
+    return df.iloc[::step].copy()
+
+def thin_times(times, max_lines=120):
+    if len(times) <= max_lines:
+        return times
+    step = int(np.ceil(len(times) / max_lines))
+    return times.iloc[::step]
+
+def compress_alarm_events(indices, min_gap_points=ALARM_MIN_GAP_POINTS):
+    if len(indices) == 0:
+        return np.array([], dtype=int)
+    indices = np.sort(np.asarray(indices))
+    events = [indices[0]]
+    for idx in indices[1:]:
+        if idx - events[-1] > min_gap_points:
+            events.append(idx)
+    return np.array(events, dtype=int)
+
+def estimate_virtual_eol_threshold(df, failure_threshold):
+    h = df['health'].dropna().values
+    if len(h) == 0:
+        return max(0.68, failure_threshold - 0.05)
+
+    qv = np.quantile(h, VIRTUAL_EOL_QUANTILE)
+    virtual_eol = max(qv, VIRTUAL_EOL_FLOOR)
+    virtual_eol = min(virtual_eol, failure_threshold - 0.02)
+    if virtual_eol >= failure_threshold:
+        virtual_eol = failure_threshold - 0.02
+    return float(virtual_eol)
+
+def get_robust_degradation_slope(k_hat, fallback=-5e-4):
+    k_hat = np.asarray(k_hat)
+    valid = k_hat[np.isfinite(k_hat)]
+
+    recent = valid[-2000:] if len(valid) > 0 else np.array([])
+    recent_neg = recent[recent < -MIN_ABS_SLOPE]
+    if len(recent_neg) > 0:
+        return float(np.median(recent_neg))
+
+    global_neg = valid[valid < -MIN_ABS_SLOPE]
+    if len(global_neg) > 0:
+        return float(np.median(global_neg))
+
+    return float(fallback)
+
+def format_threshold_time(t, current_mu, tau):
+    if current_mu <= tau:
+        return 'Crossed'
+    if not np.isfinite(t):
+        return 'Unavailable'
+    return f'{t:.2f}'
+
+def compute_local_slope_rate(time_hours, health_values, window_points=240, min_points=30):
+    n = len(health_values)
+    rates = np.full(n, np.nan)
+
+    for i in range(n):
+        start = max(0, i - window_points // 2)
+        end = min(n, i + window_points // 2 + 1)
+        if end - start < min_points:
+            continue
+
+        t_win = time_hours[start:end]
+        y_win = health_values[start:end]
+        valid = np.isfinite(t_win) & np.isfinite(y_win)
+        if valid.sum() < min_points:
+            continue
+
+        slope, _, _, _, _ = linregress(t_win[valid], y_win[valid])
+        rates[i] = max(-slope, 0.0)
+
+    return rates
+
+# ===================================================
+# 数据读取与预处理
+# ===================================================
+def load_real_data(file_path):
+    df = pd.read_csv(file_path)
+
+    required_cols = ['timestamp', 'health', 'degradation', 'condition', 'cleaning_effect']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"缺少必要列: {missing}")
+
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    df = df.drop_duplicates(subset=['timestamp'])
+    df = df.dropna(subset=required_cols).reset_index(drop=True)
+
+    t0 = df['timestamp'].iloc[0]
+    df['time_hours'] = (df['timestamp'] - t0).dt.total_seconds() / 3600.0
+
+    dt = df['time_hours'].diff()
+    median_dt = dt.dropna().median()
+    if pd.isna(median_dt) or median_dt <= 0:
+        median_dt = 1.0 / 60.0
+    df['dt_hours'] = dt.fillna(median_dt)
+    df.loc[df['dt_hours'] <= 0, 'dt_hours'] = median_dt
+
+    df['health_smooth'] = (
+        df['health']
+        .rolling(SMOOTH_WINDOW, center=True, min_periods=1)
+        .mean()
+    )
+
+    local_rate = compute_local_slope_rate(
+        df['time_hours'].values,
+        df['health_smooth'].values,
+        window_points=240,
+        min_points=30
+    )
+
+    deg_rate = pd.Series(local_rate)
+    deg_rate = deg_rate.replace([np.inf, -np.inf], np.nan)
+    deg_rate = deg_rate.rolling(RATE_SMOOTH_WINDOW, center=True, min_periods=1).median()
+
+    valid_deg = deg_rate.dropna()
+    if len(valid_deg) > 20:
+        noise_floor = np.nanpercentile(valid_deg, 35)
+        upper_cap = np.nanpercentile(valid_deg, 90)
+    else:
+        noise_floor = 0.0
+        upper_cap = np.nanmax(valid_deg) if len(valid_deg) > 0 else 0.0
+
+    deg_rate = deg_rate.where(deg_rate >= noise_floor, 0.0)
+    if np.isfinite(upper_cap) and upper_cap > 0:
+        deg_rate = deg_rate.clip(lower=0.0, upper=upper_cap)
+    else:
+        deg_rate = deg_rate.clip(lower=0.0)
+
+    df['deg_rate_per_hour'] = deg_rate.fillna(0.0)
+
+    df['is_cleaning'] = df['cleaning_effect'] > 0
+    df['cleaning_start'] = df['is_cleaning'] & (~df['is_cleaning'].shift(1, fill_value=False))
+
+    cats = list(df['condition'].astype('category').cat.categories)
+    mapping = {c: i for i, c in enumerate(cats)}
+    df['condition_code'] = df['condition'].map(mapping)
+
+    return df, mapping
+
+# ===================================================
+# 核心模块
+# ===================================================
+class BayesianHealthAnalyzer:
+    def __init__(self, tau_m=MAINTENANCE_THRESHOLD, tau_f=FAILURE_THRESHOLD, q=q, r=r):
+        self.tau_m = tau_m
+        self.tau_f = tau_f
+        self.q = q
+        self.r = r
+        self.mu = None
+        self.P = None
+
+    def kalman_filter(self, HI_obs, time_hours):
+        n = len(HI_obs)
+        mu = np.zeros(n)
+        P = np.zeros(n)
+
+        mu[0] = HI_obs[0]
+        P[0] = self.r * 10
+
+        for t in range(1, n):
+            dt = time_hours[t] - time_hours[t - 1]
+            if dt <= 0:
+                dt = 1e-6
+
+            q_eff = self.q * dt
+            mu_pred = mu[t - 1]
+            P_pred = P[t - 1] + q_eff
+
+            K = P_pred / (P_pred + self.r)
+            mu[t] = mu_pred + K * (HI_obs[t] - mu_pred)
+            P[t] = (1 - K) * P_pred
+
+        self.mu = mu
+        self.P = P
+        return mu, P
+
+    def compute_probabilities(self):
+        std = np.sqrt(np.maximum(self.P, 1e-12))
+        P_m = norm.cdf((self.tau_m - self.mu) / std)
+        P_f = norm.cdf((self.tau_f - self.mu) / std)
+        return P_m, P_f
+
+    def smooth_probabilities(self, P_m, P_f, window_points=PROB_SMOOTH_WINDOW):
+        P_m_s = pd.Series(P_m).rolling(window_points, center=True, min_periods=1).mean().values
+        P_f_s = pd.Series(P_f).rolling(window_points, center=True, min_periods=1).mean().values
+        return P_m_s, P_f_s
+
+    def determine_health_state_by_mu(self):
+        states = []
+        for v in self.mu:
+            if v > self.tau_m:
+                states.append('H')
+            elif v > self.tau_f:
+                states.append('D')
+            else:
+                states.append('C')
+        return states
+
+class TrendExtrapolator:
+    def __init__(self, window_points=TREND_WINDOW_POINTS):
+        self.window_points = window_points
+
+    def fit_local_trend(self, time_hours, mu_values):
+        n = len(mu_values)
+        k_hat = np.full(n, np.nan)
+        k_var = np.full(n, np.nan)
+
+        for i in range(n):
+            start = max(0, i - self.window_points)
+            end = min(n, i + self.window_points + 1)
+            if end - start < 20:
+                continue
+
+            t_win = time_hours[start:end]
+            y_win = mu_values[start:end]
+            slope, intercept, r_value, p_value, std_err = linregress(t_win, y_win)
+            k_hat[i] = slope
+            k_var[i] = std_err ** 2 if np.isfinite(std_err) else np.nan
+
+        return k_hat, k_var
+
+    def estimate_time_to_threshold_robust(
+        self, mu_t, k_t, P_t, tau, k_var,
+        min_abs_slope=MIN_ABS_SLOPE,
+        max_rul=MAX_RUL_HOURS
+    ):
+        if mu_t <= tau:
+            return np.nan, np.nan, 0
+
+        if (not np.isfinite(k_t)) or (k_t >= -min_abs_slope):
+            return np.nan, np.nan, 2
+
+        T_hat = (mu_t - tau) / (-k_t)
+        if (not np.isfinite(T_hat)) or (T_hat < 0):
+            return np.nan, np.nan, 2
+
+        T_hat = min(T_hat, max_rul)
+
+        if not np.isfinite(k_var):
+            k_var = 0.0
+
+        T_var = ((1 / (-k_t)) ** 2) * P_t + (((mu_t - tau) / (k_t ** 2)) ** 2) * k_var
+        T_std = np.sqrt(max(T_var, 0.0))
+        if not np.isfinite(T_std):
+            T_std = np.nan
+
+        return T_hat, T_std, 1
+
+    def simulate_threshold_hitting_distribution(
+        self,
+        current_mu,
+        current_P,
+        recent_slopes,
+        target_threshold,
+        process_noise_std,
+        horizon_hours=MC_HORIZON_HOURS,
+        dt_hours=MC_DT_HOURS,
+        n_samples=MC_SAMPLES,
+        allow_start_below=False,
+        fallback_slope=-5e-4
+    ):
+        if (current_mu <= target_threshold) and (not allow_start_below):
+            return np.array([])
+
+        recent_slopes = np.asarray(recent_slopes)
+        valid_slopes = recent_slopes[np.isfinite(recent_slopes)]
+        valid_slopes = valid_slopes[valid_slopes < -MIN_ABS_SLOPE]
+
+        if len(valid_slopes) > 0:
+            slope_mean = np.median(valid_slopes)
+            slope_std = np.std(valid_slopes)
+        else:
+            slope_mean = fallback_slope
+            slope_std = abs(fallback_slope) * 0.25
+
+        if (not np.isfinite(slope_std)) or (slope_std <= 1e-8):
+            slope_std = max(abs(slope_mean) * 0.2, 1e-5)
+
+        meas_std = np.sqrt(max(current_P, 1e-10))
+        proc_std = max(process_noise_std, 1e-5)
+
+        t_grid = np.arange(0, horizon_hours + dt_hours, dt_hours)
+        hits = []
+
+        for _ in range(n_samples):
+            mu0 = np.random.normal(current_mu, meas_std)
+            slope = np.random.normal(slope_mean, slope_std)
+
+            if slope >= -1e-6:
+                slope = -abs(slope_mean)
+
+            y = mu0
+            hit_time = np.nan
+
+            for t in t_grid:
+                if y <= target_threshold:
+                    hit_time = t
+                    break
+                y = y + slope * dt_hours + np.random.normal(0, proc_std)
+
+            if not np.isnan(hit_time):
+                hits.append(hit_time)
+
+        return np.array(hits)
+
+# ===================================================
+# rolling z-score + 单边CUSUM
+# ===================================================
+class RollingCUSUMDetector:
+    def __init__(self, baseline_window=ZSCORE_BASELINE_WINDOW, z_threshold=ZSCORE_THRESHOLD, k=CUSUM_K, h=CUSUM_H):
+        self.baseline_window = baseline_window
+        self.z_threshold = z_threshold
+        self.k = k
+        self.h = h
+        self.G_history = None
+        self.z_history = None
+        self.baseline_median = None
+        self.baseline_std = None
+        self.event_indices = None
+        self.alarm_flags = None
+
+    def fit_transform(self, deg_rate):
+        s = pd.Series(deg_rate)
+
+        rolling_median = s.rolling(
+            self.baseline_window,
+            min_periods=max(60, self.baseline_window // 10)
+        ).median()
+        rolling_std = s.rolling(
+            self.baseline_window,
+            min_periods=max(60, self.baseline_window // 10)
+        ).std()
+
+        early = s.iloc[:min(len(s), self.baseline_window)]
+        fallback_med = early.median()
+        fallback_std = early.std()
+        if not np.isfinite(fallback_std) or fallback_std <= 1e-8:
+            fallback_std = max(s.std(), 1e-6)
+
+        rolling_median = rolling_median.fillna(fallback_med)
+        rolling_std = rolling_std.fillna(fallback_std).clip(lower=1e-6)
+
+        z = (s - rolling_median) / rolling_std
+        score = (z - self.z_threshold).clip(lower=0)
+
+        G = np.zeros(len(score))
+        alarm_flags = np.zeros(len(score), dtype=bool)
+
+        for i in range(1, len(score)):
+            G[i] = max(0, G[i - 1] + score.iloc[i] - self.k)
+            if G[i] >= self.h:
+                alarm_flags[i] = True
+                G[i] = 0.0
+
+        self.G_history = G
+        self.z_history = z.values
+        self.baseline_median = rolling_median.values
+        self.baseline_std = rolling_std.values
+        self.alarm_flags = alarm_flags
+        self.event_indices = self.detect_acceleration()
+
+        return G, z.values
+
+    def detect_acceleration(self, G=None):
+        if self.alarm_flags is None:
+            return np.array([], dtype=int)
+        raw_idx = np.where(self.alarm_flags)[0]
+        return compress_alarm_events(raw_idx, min_gap_points=ALARM_MIN_GAP_POINTS)
+
+# ===================================================
+# 真实清洗恢复统计
+# ===================================================
+def compute_real_recovery(df):
+    starts = df.index[df['cleaning_start']].tolist()
+    vals = []
+    events = []
+
+    for idx in starts:
+        if idx > 0 and idx < len(df):
+            before = df.loc[idx - 1, 'health']
+            after = df.loc[idx, 'health']
+            delta = after - before
+            events.append({
+                'timestamp': df.loc[idx, 'timestamp'],
+                'health_before': before,
+                'health_after': after,
+                'delta_health': delta,
+                'cleaning_effect': df.loc[idx, 'cleaning_effect']
+            })
+            if delta > 0:
+                vals.append(delta)
+
+    if len(events) == 0:
+        events_df = pd.DataFrame(columns=['timestamp', 'health_before', 'health_after', 'delta_health', 'cleaning_effect'])
+    else:
+        events_df = pd.DataFrame(events)
+
+    return (float(np.mean(vals)) if len(vals) > 0 else 0.0), events_df
+
+# ===================================================
+# 可视化
+# ===================================================
+def create_health_state_chart(df, df_plot, analyzer, P_m_smooth, P_f_smooth, states):
+    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    plt.subplots_adjust(hspace=0.35, bottom=0.08)
+
+    x = df_plot['timestamp']
+    plot_idx = df_plot.index.values
+    cleaning_times = thin_times(df.loc[df['cleaning_start'], 'timestamp'])
+
+    ax1 = axes[0]
+    ax1.plot(x, df_plot['health'], color=colors['observed'], alpha=0.6, linewidth=0.8, label='Observed health')
+    ax1.plot(x, analyzer.mu[plot_idx], color=colors['kalman'], linewidth=1.5, label='Kalman estimate')
+    std = np.sqrt(np.maximum(analyzer.P[plot_idx], 1e-12))
+    ax1.fill_between(
+        x,
+        analyzer.mu[plot_idx] - 2 * std,
+        analyzer.mu[plot_idx] + 2 * std,
+        color=colors['confidence'],
+        alpha=0.25,
+        label='95% CI'
+    )
+    ax1.axhline(MAINTENANCE_THRESHOLD, color=colors['threshold'], linestyle='--', label=f'Maintenance threshold ({MAINTENANCE_THRESHOLD})')
+    ax1.axhline(FAILURE_THRESHOLD, color=colors['failure'], linestyle='--', label=f'Failure threshold ({FAILURE_THRESHOLD})')
+    for t in cleaning_times:
+        ax1.axvline(t, color=colors['cleaning'], linestyle=':', alpha=0.12, linewidth=0.8)
+    ax1.set_ylabel('Health Index')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    add_subcaption(ax1, '(a) Health index estimation and uncertainty')
+
+    ax2 = axes[1]
+    ax2.plot(x, P_m_smooth[plot_idx], color=colors['bayes'], label='$P(HI < \\tau_m)$')
+    ax2.plot(x, P_f_smooth[plot_idx], color=colors['failure'], label='$P(HI < \\tau_f)$')
+    ax2.axhline(P_m_star, color=colors['maintenance'], linestyle=':', label=f'$P_m^*={P_m_star:.3f}$')
+    ax2.axhline(P_f_star, color=colors['failure'], linestyle=':', alpha=0.7, label=f'$P_f^*={P_f_star:.3f}$')
+    ax2.set_ylabel('Probability')
+    ax2.set_ylim(-0.02, 1.02)
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.3)
+    add_subcaption(ax2, '(b) Probability of being below thresholds')
+
+    ax3 = axes[2]
+    state_to_num = {'H': 2, 'D': 1, 'C': 0}
+    state_num = np.array([state_to_num[s] for s in np.array(states)[plot_idx]])
+    ax3.step(x, state_num, where='post', color='black', linewidth=1.0)
+    ax3.fill_between(x, 0, state_num, step='post', color=colors['healthy'], alpha=0.12)
+    ax3.set_yticks([0, 1, 2])
+    ax3.set_yticklabels(['Critical', 'Degrading', 'Healthy'])
+    ax3.set_ylabel('State')
+    ax3.grid(True, alpha=0.2)
+    add_subcaption(ax3, '(c) Health state classification')
+
+    ax4 = axes[3]
+    ax4.scatter(x, df_plot['condition_code'], s=6, color=colors['trend'])
+    cond_map_rev = df[['condition', 'condition_code']].drop_duplicates().sort_values('condition_code')
+    ax4.set_yticks(sorted(df['condition_code'].unique()))
+    ax4.set_yticklabels(cond_map_rev['condition'].tolist())
+    ax4.set_ylabel('Condition')
+    ax4.set_xlabel('')
+    ax4.grid(True, alpha=0.3)
+    add_subcaption(ax4, '(d) Operating condition over time')
+
+    return fig
+
+def create_trend_extrapolation_chart(df, df_plot, analyzer, extrapolator, virtual_eol):
+    fig = plt.figure(figsize=(12, 10))
+    gs = plt.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.28)
+    fig.subplots_adjust(bottom=0.08)
+
+    time_hours = df['time_hours'].values
+    x_time = df_plot['timestamp']
+    plot_idx = df_plot.index.values
+
+    k_hat, k_var = extrapolator.fit_local_trend(time_hours, analyzer.mu)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(x_time, analyzer.mu[plot_idx], color=colors['kalman'], label='Kalman estimate')
+    ax1.axhline(MAINTENANCE_THRESHOLD, color=colors['threshold'], linestyle='--')
+    ax1.axhline(FAILURE_THRESHOLD, color=colors['failure'], linestyle='--')
+    ax1.axhline(virtual_eol, color=colors['terminal'], linestyle='--', alpha=0.8)
+    ax1.set_ylabel('Health Index')
+    ax1.grid(True, alpha=0.3)
+    add_subcaption(ax1, '(a) Local linear trend fitting')
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    deg_rate_local = np.maximum(-k_hat * 1000, 0)
+    if np.isfinite(deg_rate_local).any():
+        upper_cap = np.nanpercentile(deg_rate_local[np.isfinite(deg_rate_local)], 85)
+        if np.isfinite(upper_cap) and upper_cap > 0:
+            deg_rate_local = np.clip(deg_rate_local, 0, upper_cap)
+    ax2.plot(x_time, deg_rate_local[plot_idx], color=colors['trend'])
+    ax2.axhline(0, color='black', linewidth=0.8)
+    ax2.set_ylabel('Degradation rate (‰/hour)')
+    ax2.grid(True, alpha=0.3)
+    add_subcaption(ax2, '(b) Local degradation rate')
+
+    ax3 = fig.add_subplot(gs[1, 0])
+    Tm = np.full(len(df), np.nan)
+    Tf = np.full(len(df), np.nan)
+    Tm_std = np.full(len(df), np.nan)
+    flag_m = np.full(len(df), np.nan)
+
+    for i in range(len(df)):
+        t1, s1, f1 = extrapolator.estimate_time_to_threshold_robust(
+            analyzer.mu[i], k_hat[i], analyzer.P[i], MAINTENANCE_THRESHOLD, k_var[i]
+        )
+        t2, _, _ = extrapolator.estimate_time_to_threshold_robust(
+            analyzer.mu[i], k_hat[i], analyzer.P[i], FAILURE_THRESHOLD, k_var[i]
+        )
+        Tm[i], Tm_std[i], flag_m[i] = t1, s1, f1
+        Tf[i] = t2
+
+    Tf_plot = Tf.copy()
+    Tf_plot[analyzer.mu <= FAILURE_THRESHOLD] = np.nan
+
+    ax3.plot(x_time, Tm[plot_idx], color=colors['maintenance'], label='To maintenance threshold')
+    ax3.plot(x_time, Tf_plot[plot_idx], color=colors['failure'], label='To failure threshold (before crossing)')
+    valid = np.isfinite(Tm[plot_idx]) & np.isfinite(Tm_std[plot_idx])
+    if valid.any():
+        ax3.fill_between(
+            x_time[valid],
+            Tm[plot_idx][valid] - Tm_std[plot_idx][valid],
+            Tm[plot_idx][valid] + Tm_std[plot_idx][valid],
+            color=colors['maintenance'],
+            alpha=0.15
+        )
+    ax3.set_ylabel('Estimated remaining time (hours)')
+    ax3.legend(loc='upper right')
+    ax3.grid(True, alpha=0.3)
+    add_subcaption(ax3, '(c) Estimated remaining time to decision thresholds')
+
+    ax4 = fig.add_subplot(gs[1, 1])
+    idx = len(df) - 1
+    current_mu = analyzer.mu[idx]
+    current_P = analyzer.P[idx]
+
+    robust_slope = get_robust_degradation_slope(k_hat, fallback=-5e-4)
+    recent_slopes = np.array([robust_slope])
+
+    residual = df['health'].values - analyzer.mu
+    process_noise_std = np.nanstd(residual[-5000:])
+    if (not np.isfinite(process_noise_std)) or (process_noise_std <= 1e-6):
+        process_noise_std = 0.002
+
+    failure_samples = extrapolator.simulate_threshold_hitting_distribution(
+        current_mu=current_mu,
+        current_P=current_P,
+        recent_slopes=recent_slopes,
+        target_threshold=FAILURE_THRESHOLD,
+        process_noise_std=process_noise_std,
+        horizon_hours=MC_HORIZON_HOURS,
+        dt_hours=MC_DT_HOURS,
+        n_samples=MC_SAMPLES,
+        allow_start_below=False,
+        fallback_slope=robust_slope
+    )
+
+    pseudo_samples = extrapolator.simulate_threshold_hitting_distribution(
+        current_mu=current_mu,
+        current_P=current_P,
+        recent_slopes=recent_slopes,
+        target_threshold=virtual_eol,
+        process_noise_std=process_noise_std,
+        horizon_hours=MC_HORIZON_HOURS,
+        dt_hours=MC_DT_HOURS,
+        n_samples=MC_SAMPLES,
+        allow_start_below=True,
+        fallback_slope=robust_slope
+    )
+
+    has_failure_dist = len(failure_samples) > 0 and np.any(failure_samples > 0)
+    has_pseudo_dist = len(pseudo_samples) > 0 and np.any(pseudo_samples > 0)
+
+    if has_failure_dist:
+        bins1 = np.linspace(0, max(failure_samples.max(), 1), 30)
+        ax4.hist(
+            failure_samples,
+            bins=bins1,
+            density=True,
+            alpha=0.35,
+            color=colors['bayes'],
+            label='To failure threshold'
+        )
+        mu_fail = np.mean(failure_samples)
+        ax4.axvline(mu_fail, color=colors['maintenance'], linestyle='--', label=f'Failure mean={mu_fail:.2f}h')
+    else:
+        ax4.text(
+            0.5, 0.72, 'Failure-threshold crossing already occurred',
+            transform=ax4.transAxes, ha='center', va='center', fontsize=10, color=colors['failure']
+        )
+
+    if has_pseudo_dist:
+        bins2 = np.linspace(0, max(pseudo_samples.max(), 1), 30)
+        ax4.hist(
+            pseudo_samples,
+            bins=bins2,
+            density=True,
+            alpha=0.30,
+            color=colors['terminal'],
+            label=f'Pseudo-life to virtual EOL ({virtual_eol:.2f})'
+        )
+        mu_pseudo = np.mean(pseudo_samples)
+        ax4.axvline(mu_pseudo, color=colors['terminal'], linestyle='--', label=f'Pseudo mean={mu_pseudo:.2f}h')
+
+    if (not has_failure_dist) and (not has_pseudo_dist):
+        ax4.text(
+            0.5, 0.55, 'No valid future-life distribution',
+            transform=ax4.transAxes, ha='center', va='center', fontsize=11
+        )
+        ax4.text(
+            0.5, 0.45, 'Please inspect slope / noise assumptions',
+            transform=ax4.transAxes, ha='center', va='center', fontsize=10
+        )
+
+    ax4.set_xlabel('Remaining time / pseudo-life (hours)')
+    ax4.set_ylabel('Probability density')
+    ax4.grid(True, alpha=0.3)
+    ax4.legend(loc='upper right')
+    add_subcaption(ax4, '(d) Distribution of remaining time and pseudo-life')
+
+    return fig, Tm, Tf, Tm_std, k_hat, k_var, flag_m
+
+def create_acceleration_detection_chart(df, df_plot, detector, deg_rate):
+    fig = plt.figure(figsize=(12, 10))
+    gs = plt.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.28)
+    fig.subplots_adjust(bottom=0.08)
+
+    x = df_plot['timestamp']
+    plot_idx = df_plot.index.values
+
+    G, z = detector.fit_transform(deg_rate)
+    acc_points = detector.detect_acceleration()
+
+    baseline_med = detector.baseline_median
+    accelerated_ref = baseline_med + detector.z_threshold * detector.baseline_std
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(x, deg_rate[plot_idx] * 1000, color=colors['observed'])
+    ax1.plot(x, baseline_med[plot_idx] * 1000, color=colors['healthy'], linestyle='--', label='Rolling normal level')
+    ax1.plot(x, accelerated_ref[plot_idx] * 1000, color=colors['critical'], linestyle='--', label='Acceleration threshold')
+    ax1.set_ylabel('Degradation rate (‰/hour)')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    add_subcaption(ax1, '(a) Degradation rate and reference levels')
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.plot(x, G[plot_idx], color=colors['cusum'], label='CUSUM')
+    ax2.axhline(detector.h, color=colors['threshold'], linestyle='--', label=f'h={detector.h:.2f}')
+    if len(acc_points) > 0:
+        plot_alarm_idx = [i for i in acc_points if i in set(plot_idx)]
+        if len(plot_alarm_idx) > 0:
+            ts = df.loc[plot_alarm_idx, 'timestamp']
+            ax2.scatter(ts, np.full(len(ts), detector.h), color=colors['critical'], s=20, label='Acceleration events')
+    ax2.set_ylabel('CUSUM statistic')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.3)
+    add_subcaption(ax2, '(b) CUSUM statistic for change detection')
+
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.plot(x, z[plot_idx], color=colors['bayes'], label='Rolling z-score')
+    sig = np.where(z >= detector.z_threshold)[0]
+    plot_sig = [i for i in sig if i in set(plot_idx)]
+    if len(plot_sig) > 0:
+        ax3.scatter(df.loc[plot_sig, 'timestamp'], z[plot_sig], color=colors['critical'], s=10, alpha=0.6, label='Significant')
+    ax3.axhline(detector.z_threshold, color=colors['threshold'], linestyle='--', linewidth=0.8)
+    ax3.axhline(0, color='black', linewidth=0.8)
+    ax3.set_ylabel('z_t')
+    ax3.legend(loc='upper right')
+    ax3.grid(True, alpha=0.3)
+    add_subcaption(ax3, '(c) Rolling z-score for anomaly detection')
+
+    # 更有信息量的敏感性图：事件数 + 首次检测延迟
+    ax4 = fig.add_subplot(gs[1, 1])
+    thresholds = np.linspace(max(2.0, detector.z_threshold - 1.0), detector.z_threshold + 2.0, 20)
+    event_counts = []
+    first_delays = []
+
+    base_events = acc_points.copy()
+
+    for th in thresholds:
+        score = np.clip(z - th, 0, None)
+        G_tmp = np.zeros_like(score, dtype=float)
+        alarm_tmp = np.zeros_like(score, dtype=bool)
+
+        for i in range(1, len(score)):
+            G_tmp[i] = max(0, G_tmp[i - 1] + score[i] - detector.k)
+            if G_tmp[i] >= detector.h:
+                alarm_tmp[i] = True
+                G_tmp[i] = 0.0
+
+        event_tmp = compress_alarm_events(np.where(alarm_tmp)[0], min_gap_points=ALARM_MIN_GAP_POINTS)
+        event_counts.append(len(event_tmp))
+
+        if len(event_tmp) > 0 and len(base_events) > 0:
+            first_delays.append(max(0, event_tmp[0] - base_events[0]))
+        else:
+            first_delays.append(np.nan)
+
+    ax4_t = ax4.twinx()
+    ax4.plot(thresholds, event_counts, color=colors['failure'], label='Detected event count')
+    ax4_t.plot(thresholds, first_delays, color=colors['bayes'], linestyle='--', label='First detection delay')
+    ax4.axvline(detector.z_threshold, color=colors['threshold'], linestyle=':', label='Current z-threshold')
+    ax4.set_xlabel('Detection threshold (z-score)')
+    ax4.set_ylabel('Detected event count')
+    ax4_t.set_ylabel('First delay (points)')
+    ax4.grid(True, alpha=0.3)
+    add_subcaption(ax4, '(d) Detection sensitivity to z-threshold')
+
+    return fig, G, z, acc_points
+
+def create_maintenance_optimization_chart(df, analyzer, optimizer, states, P_m_smooth, P_f_smooth, Tm, Tf, virtual_eol, extrapolator, k_hat):
+    fig = plt.figure(figsize=(12, 10))
+    gs = plt.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.32)
+    fig.subplots_adjust(bottom=0.08)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    HI_range = np.linspace(0.5, 1.0, 200)
+    fuel = np.array([optimizer.fuel_penalty_cost(h) for h in HI_range])
+    risk = np.array([optimizer.risk_cost(h) for h in HI_range])
+    total = np.array([optimizer.total_operational_cost(h) for h in HI_range])
+
+    ax1.plot(HI_range, fuel, color=colors['trend'], label='Fuel penalty')
+    ax1.plot(HI_range, total, color=colors['maintenance'], label='Total cost')
+    ax1.set_xlabel('Health Index')
+    ax1.set_ylabel('Cost ($/day)')
+
+    ax1_t = ax1.twinx()
+    ax1_t.plot(HI_range, risk, color=colors['risk'], label='Risk cost', linestyle='--')
+    ax1_t.set_ylabel('Risk cost ($/day)', labelpad=12)
+
+    ax1.axvline(MAINTENANCE_THRESHOLD, color=colors['threshold'], linestyle='--')
+    ax1.axvline(FAILURE_THRESHOLD, color=colors['failure'], linestyle='--')
+    ax1.grid(True, alpha=0.3)
+    add_subcaption(ax1, '(a) Daily operational cost components')
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    opt_time, opt_cost, costs, times = optimizer.optimize_cleaning_schedule(df['time_hours'].values, analyzer.mu, horizon_hours=72)
+    if len(times) > 0:
+        ax2.plot(times, costs, color=colors['maintenance'], label='Cumulative cost')
+        if np.isfinite(opt_time):
+            ax2.scatter(opt_time, opt_cost, color=colors['critical'], s=60, label=f'Optimal {opt_time:.2f} h')
+            ax2.axvline(opt_time, color=colors['threshold'], linestyle=':')
+        ax2.legend(loc='upper right')
+    ax2.set_xlabel('Cleaning time from current start (hours)')
+    ax2.set_ylabel('Cumulative cost ($)')
+    ax2.ticklabel_format(style='plain', axis='y', useOffset=False)
+    ax2.grid(True, alpha=0.3)
+    add_subcaption(ax2, '(b) Cleaning schedule optimization')
+
+    ax3 = fig.add_subplot(gs[1, 0])
+    current_HI = analyzer.mu[-1]
+    base_cost = optimizer.total_operational_cost(current_HI, 3)
+    clean_cost = optimizer.cleaning_cost()
+
+    strategies = ['Threshold 0.88', 'Threshold 0.85', 'Cost-sensitive', 'No cleaning']
+    cost_thr88 = base_cost + (clean_cost if current_HI < 0.88 else 0)
+    cost_thr85 = base_cost + (clean_cost if current_HI < 0.85 else 0)
+    cost_cs = base_cost + (clean_cost if P_m_smooth[-1] > P_m_star else 0)
+    cost_none = base_cost + optimizer.risk_cost(current_HI) * 4.0
+
+    vals = [cost_thr88, cost_thr85, cost_cs, cost_none]
+    ax3.bar(
+        strategies,
+        vals,
+        color=[colors['maintenance'], colors['degrading'], colors['bayes'], colors['risk']],
+        alpha=0.8
+    )
+    ax3.set_ylabel('Estimated cost ($)')
+    ax3.grid(True, alpha=0.3, axis='y')
+    ax3.tick_params(axis='x', rotation=15)
+    add_subcaption(ax3, '(c) Comparison of maintenance strategies')
+
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.axis('off')
+
+    current_state = states[-1]
+    t_m = Tm[-1] if np.isfinite(Tm[-1]) else np.nan
+    t_f = Tf[-1] if np.isfinite(Tf[-1]) else np.nan
+    decision = 'Plan cleaning' if (current_state in ['D', 'C'] or P_m_smooth[-1] > P_m_star) else 'Continue monitoring'
+
+    robust_slope = get_robust_degradation_slope(k_hat, fallback=-5e-4)
+    recent_slopes = np.array([robust_slope])
+    residual = df['health'].values - analyzer.mu
+    process_noise_std = np.nanstd(residual[-5000:])
+    if (not np.isfinite(process_noise_std)) or (process_noise_std <= 1e-6):
+        process_noise_std = 0.002
+
+    pseudo_samples = extrapolator.simulate_threshold_hitting_distribution(
+        current_mu=analyzer.mu[-1],
+        current_P=analyzer.P[-1],
+        recent_slopes=recent_slopes,
+        target_threshold=virtual_eol,
+        process_noise_std=process_noise_std,
+        horizon_hours=MC_HORIZON_HOURS,
+        dt_hours=MC_DT_HOURS,
+        n_samples=MC_SAMPLES,
+        allow_start_below=True,
+        fallback_slope=robust_slope
+    )
+    pseudo_mean = np.mean(pseudo_samples) if len(pseudo_samples) > 0 else np.nan
+
+    table_data = [
+        ['Health estimate μ', f'{analyzer.mu[-1]:.4f}'],
+        ['Variance P', f'{analyzer.P[-1]:.6f}'],
+        ['P(HI < τm)', f'{P_m_smooth[-1]:.4f}'],
+        ['P(HI < τf)', f'{P_f_smooth[-1]:.4f}'],
+        ['Time to τm (h)', format_threshold_time(t_m, analyzer.mu[-1], MAINTENANCE_THRESHOLD)],
+        ['Time to τf (h)', format_threshold_time(t_f, analyzer.mu[-1], FAILURE_THRESHOLD)],
+        ['Pseudo-life to virtual EOL (h)', 'Unavailable' if not np.isfinite(pseudo_mean) else f'{pseudo_mean:.2f}'],
+        ['Current state', current_state],
+        ['Recommended decision', decision],
+    ]
+    table = ax4.table(cellText=table_data, colLabels=['Item', 'Value'], cellLoc='left', loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.1, 1.6)
+    add_subcaption(ax4, '(d) Real-time decision support information')
+
+    return fig
+
+def create_summary_table(df, analyzer, detector, optimizer, states, recovery_mean, virtual_eol):
+    fig, ax = plt.subplots(figsize=(12, 9))
+    ax.axis('off')
+
+    n_total = len(df)
+    n_h = states.count('H')
+    n_d = states.count('D')
+    n_c = states.count('C')
+
+    deg_rate = df['deg_rate_per_hour'].values
+    pos = deg_rate[deg_rate > 0]
+    avg_deg = np.mean(pos) * 1000 if len(pos) > 0 else 0.0
+
+    G = detector.G_history if detector.G_history is not None else np.array([])
+    acc_alerts = len(detector.detect_acceleration()) if len(G) > 0 else 0
+
+    summary_data = [
+        ['Data points', f'{n_total}'],
+        ['Time span (hours)', f'{df["time_hours"].iloc[-1]:.2f}'],
+        ['Mean Health Index', f'{df["health"].mean():.4f}'],
+        ['Health Std', f'{df["health"].std():.4f}'],
+        ['Health Range', f'{df["health"].min():.4f} - {df["health"].max():.4f}'],
+        ['Healthy (H)', f'{n_h} ({n_h/n_total*100:.2f}%)'],
+        ['Degrading (D)', f'{n_d} ({n_d/n_total*100:.2f}%)'],
+        ['Critical (C)', f'{n_c} ({n_c/n_total*100:.2f}%)'],
+        ['Avg degradation rate', f'{avg_deg:.4f} ‰/hour'],
+        ['CUSUM threshold h', f'{detector.h:.4f}'],
+        ['Acceleration alerts', f'{acc_alerts}'],
+        ['Virtual EOL threshold', f'{virtual_eol:.4f}'],
+        ['Mean real cleaning recovery', f'{recovery_mean:.6f}'],
+        ['Daily fuel cost', f'{optimizer.fuel_penalty_cost(df["health"].mean()):.2f} $'],
+        ['Daily risk cost', f'{optimizer.risk_cost(df["health"].mean()):.2f} $'],
+        ['Single cleaning cost', f'{optimizer.cleaning_cost():.2f} $'],
+    ]
+
+    table = ax.table(cellText=summary_data, colLabels=['Metric', 'Value'], cellLoc='left', loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.15, 1.6)
+
+    return fig
+
+# ===================================================
+# 维护优化
+# ===================================================
+class MaintenanceOptimizer:
+    def __init__(self, recovery_mean=0.0):
+        self.c_fuel = 600.0
+        self.m_f_base = 60.0
+        self.k_f = 0.3
+        self.C_labor = 3000.0
+        self.C_material = 2000.0
+        self.C_downtime = 3000.0
+        self.E_L = 1500000.0
+        self.alpha = 14.0
+        self.beta = 0.76
+        self.recovery_mean = recovery_mean
+
+    def fuel_penalty_cost(self, HI):
+        return self.c_fuel * self.m_f_base * (1 + self.k_f * (1 - HI))
+
+    def cleaning_cost(self):
+        return self.C_labor + self.C_material + 0.2 * self.C_downtime
+
+    def risk_cost(self, HI):
+        Pf = 1 / (1 + np.exp(self.alpha * (HI - self.beta)))
+        return self.E_L * Pf / 365
+
+    def total_operational_cost(self, HI, days=1.0):
+        return self.fuel_penalty_cost(HI) * days + self.risk_cost(HI) * days
+
+    def apply_realistic_cleaning(self, HI_before):
+        if self.recovery_mean <= 0:
+            return HI_before
+        HI_after = HI_before + self.recovery_mean
+        return min(0.995, HI_after)
+
+    def optimize_cleaning_schedule(self, time_hours, mu_sequence, horizon_hours=72):
+        n = len(mu_sequence)
+        if n < 2:
+            return np.nan, np.nan, [], []
+
+        rel_time = time_hours - time_hours[0]
+        end_idx = np.searchsorted(rel_time, horizon_hours)
+        end_idx = min(max(end_idx, 2), n)
+
+        t_sub = rel_time[:end_idx]
+        mu_sub = mu_sequence[:end_idx]
+
+        cleaning_times = []
+        cumulative_costs = []
+
+        for i in range(1, len(mu_sub) - 1):
+            cost_before = 0.0
+            for j in range(1, i + 1):
+                dt_h = t_sub[j] - t_sub[j - 1]
+                cost_before += self.total_operational_cost(mu_sub[j - 1], dt_h / 24.0)
+
+            HI_after = self.apply_realistic_cleaning(mu_sub[i])
+            post = mu_sub[i:].copy()
+            post = post - mu_sub[i] + HI_after
+            post = np.minimum(post, 0.995)
+
+            cost_after = 0.0
+            for j in range(1, len(post)):
+                dt_h = t_sub[i + j] - t_sub[i + j - 1]
+                cost_after += self.total_operational_cost(post[j - 1], dt_h / 24.0)
+
+            total = cost_before + cost_after + self.cleaning_cost()
+            cumulative_costs.append(total)
+            cleaning_times.append(t_sub[i])
+
+        if len(cumulative_costs) == 0:
+            return np.nan, np.nan, [], []
+
+        opt_idx = int(np.argmin(cumulative_costs))
+        return cleaning_times[opt_idx], cumulative_costs[opt_idx], cumulative_costs, cleaning_times
+
+# ===================================================
+# 主程序
+# ===================================================
+def main():
+    print("=" * 60)
+    print("REAL-DATA TURBOCHARGER HEALTH MANAGEMENT ANALYSIS")
+    print("=" * 60)
+
+    df, condition_map = load_real_data(data_path)
+    df_plot = thin_for_plot(df, PLOT_MAX_POINTS)
+
+    if USE_DYNAMIC_VIRTUAL_EOL:
+        virtual_eol = estimate_virtual_eol_threshold(df, FAILURE_THRESHOLD)
+    else:
+        virtual_eol = max(VIRTUAL_EOL_FLOOR, FAILURE_THRESHOLD - 0.05)
+
+    print(f"Data points: {len(df)}")
+    print(f"Plot points: {len(df_plot)}")
+    print(f"Time span (hours): {df['time_hours'].iloc[-1]:.2f}")
+    print(f"Condition categories: {list(condition_map.keys())}")
+    print(f"Virtual EOL threshold: {virtual_eol:.4f}")
+
+    recovery_mean, events_df = compute_real_recovery(df)
+    print(f"Detected cleaning starts: {df['cleaning_start'].sum()}")
+    print(f"Mean real recovery from cleaning: {recovery_mean:.6f}")
+
+    HI_obs = df['health'].values
+    time_hours = df['time_hours'].values
+
+    analyzer = BayesianHealthAnalyzer(MAINTENANCE_THRESHOLD, FAILURE_THRESHOLD, q, r)
+    mu, P = analyzer.kalman_filter(HI_obs, time_hours)
+    P_m, P_f = analyzer.compute_probabilities()
+    P_m_s, P_f_s = analyzer.smooth_probabilities(P_m, P_f, window_points=PROB_SMOOTH_WINDOW)
+    states = analyzer.determine_health_state_by_mu()
+
+    extrapolator = TrendExtrapolator(TREND_WINDOW_POINTS)
+    deg_rate = df['deg_rate_per_hour'].values
+
+    detector = RollingCUSUMDetector(
+        baseline_window=ZSCORE_BASELINE_WINDOW,
+        z_threshold=ZSCORE_THRESHOLD,
+        k=CUSUM_K,
+        h=CUSUM_H
+    )
+    G, z = detector.fit_transform(deg_rate)
+    acc_points = detector.detect_acceleration()
+
+    optimizer = MaintenanceOptimizer(recovery_mean=recovery_mean)
+
+    fig1 = create_health_state_chart(df, df_plot, analyzer, P_m_s, P_f_s, states)
+    fig1.savefig(os.path.join(output_path, 'health_state_classification.png'), bbox_inches='tight')
+    plt.close(fig1)
+
+    fig2, Tm, Tf, Tm_std, k_hat, k_var, flag_m = create_trend_extrapolation_chart(
+        df, df_plot, analyzer, extrapolator, virtual_eol
+    )
+    fig2.savefig(os.path.join(output_path, 'trend_extrapolation.png'), bbox_inches='tight')
+    plt.close(fig2)
+
+    fig3, G, z, acc_points = create_acceleration_detection_chart(df, df_plot, detector, deg_rate)
+    fig3.savefig(os.path.join(output_path, 'acceleration_detection.png'), bbox_inches='tight')
+    plt.close(fig3)
+
+    fig4 = create_maintenance_optimization_chart(
+        df, analyzer, optimizer, states, P_m_s, P_f_s, Tm, Tf, virtual_eol, extrapolator, k_hat
+    )
+    fig4.savefig(os.path.join(output_path, 'maintenance_optimization.png'), bbox_inches='tight')
+    plt.close(fig4)
+
+    fig5 = create_summary_table(df, analyzer, detector, optimizer, states, recovery_mean, virtual_eol)
+    fig5.savefig(os.path.join(output_path, 'analysis_summary.png'), bbox_inches='tight')
+    plt.close(fig5)
+
+    out_df = df.copy()
+    out_df['mu_estimated'] = mu
+    out_df['P_variance'] = P
+    out_df['P_maintenance'] = P_m
+    out_df['P_failure'] = P_f
+    out_df['P_maintenance_smooth'] = P_m_s
+    out_df['P_failure_smooth'] = P_f_s
+    out_df['health_state'] = states
+    out_df['local_trend'] = k_hat
+    out_df['local_degradation_rate'] = np.maximum(-k_hat, 0)
+    out_df['time_to_maintenance'] = Tm
+    out_df['time_to_failure'] = Tf
+    out_df['rul_flag'] = flag_m
+    out_df['cusum_G'] = G
+    out_df['rolling_zscore'] = z
+    out_df['virtual_eol_threshold'] = virtual_eol
+    out_df.to_csv(os.path.join(output_path, 'detailed_results_realdata.csv'), index=False)
+
+    if len(events_df) > 0:
+        events_df.to_csv(os.path.join(output_path, 'real_cleaning_events.csv'), index=False)
+
+    print("\nAnalysis complete.")
+    print(f"Results overwritten in: {output_path}")
+    print(f"Acceleration alert events detected: {len(acc_points)}")
+
+if __name__ == "__main__":
+    main()
